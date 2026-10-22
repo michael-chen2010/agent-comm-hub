@@ -13,6 +13,7 @@
  */
 
 import { spawn } from 'node:child_process'
+import { randomUUID } from 'node:crypto'
 import { fileURLToPath } from 'node:url'
 import { dirname, join } from 'node:path'
 import { tmpdir } from 'node:os'
@@ -60,7 +61,21 @@ function stopProc(child) {
 function makeClient(name, base, token) {
   const headers = token === undefined ? {} : { Authorization: `Bearer ${token}` }
   let id = 0
-  return {
+  let agentSessionToken
+  const prepareArgs = (tool, args) => {
+    const prepared = { ...(args ?? {}) }
+    if (tool === 'bridge_register') {
+      if (prepared.agentSessionToken === undefined && prepared.registrationRequestId === undefined) {
+        if (agentSessionToken !== undefined) prepared.agentSessionToken = agentSessionToken
+        else prepared.registrationRequestId = randomUUID()
+      }
+    } else {
+      if (agentSessionToken === undefined) throw new Error(`${name} ${tool}: call bridge_register first`)
+      prepared.agentSessionToken = agentSessionToken
+    }
+    return prepared
+  }
+  const client = {
     name,
     sessionId: () => headers['Mcp-Session-Id'],
     async rpc(method, params) {
@@ -80,15 +95,26 @@ function makeClient(name, base, token) {
       const r = await this.rpc('initialize', { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: this.name, version: '1' } })
       if (r.json?.result?.protocolVersion !== '2025-06-18') throw new Error(`${this.name} initialize failed: ${r.text}`)
       await this.rpc('notifications/initialized')
+      await this.call('bridge_register', token === undefined ? { peerId: this.name } : {})
     },
     async call(tool, args) {
-      const r = await this.rpc('tools/call', { name: tool, arguments: args ?? {} })
+      const prepared = prepareArgs(tool, args)
+      const r = await this.rpc('tools/call', { name: tool, arguments: prepared })
       const text = r.json?.result?.content?.[0]?.text
       const parsed = JSON.parse(text ?? '{}')
-      if (r.json?.result?.isError) throw new Error(`${this.name} ${tool}: ${text}`)
+      const isError = r.json?.result?.isError === true
+      if (isError && typeof parsed.error === 'string' && parsed.error.includes('agentSessionToken is invalid or expired')) {
+        agentSessionToken = undefined
+      } else if (!isError && tool === 'bridge_register' && typeof parsed.agentSessionToken === 'string') {
+        agentSessionToken = parsed.agentSessionToken
+      } else if (!isError && tool === 'bridge_unregister' && prepared.peer === undefined) {
+        agentSessionToken = undefined
+      }
+      if (isError) throw new Error(`${this.name} ${tool}: ${text}`)
       return parsed
     },
   }
+  return client
 }
 
 /** Open an SSE stream for a client; returns { waitFor(substr, ms), cancel }. */

@@ -20,6 +20,7 @@ use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, RwLock};
+use uuid::Uuid;
 
 #[derive(Debug, thiserror::Error)]
 pub enum McpError {
@@ -89,6 +90,8 @@ pub struct McpClient {
     /// timeout off, so a separate client is required.)
     sse_http: reqwest::Client,
     session_id: Arc<RwLock<Option<String>>>,
+    /// Business identity capability returned by bridge_register; distinct from the MCP transport session.
+    agent_session_token: Arc<RwLock<Option<String>>>,
     next_id: Arc<RwLock<u64>>,
     state: Arc<RwLock<ConnState>>,
     client_info: ClientInfo,
@@ -149,6 +152,7 @@ impl McpClient {
             http,
             sse_http,
             session_id: Arc::new(RwLock::new(None)),
+            agent_session_token: Arc::new(RwLock::new(None)),
             next_id: Arc::new(RwLock::new(1)),
             state: Arc::new(RwLock::new(ConnState::Disconnected)),
             client_info,
@@ -171,6 +175,7 @@ impl McpClient {
     /// can never recover — this is the reconnect primitive.
     async fn clear_session(&self) {
         self.session_id.write().await.take();
+        self.agent_session_token.write().await.take();
         *self.state.write().await = ConnState::Disconnected;
     }
 
@@ -179,7 +184,7 @@ impl McpClient {
         matches!(*self.state.read().await, ConnState::Connected)
     }
 
-    /// `initialize`: establish a session + trigger the hub-end eager auto-registration (based on clientInfo.name).
+    /// initialize establishes the MCP transport session; business identity is acquired separately via bridge_register.
     pub async fn initialize(&self) -> Result<Value> {
         // A fresh initialize MUST NOT carry a session id (spec), and the hub now
         // answers an unknown id with 404: presenting the one we kept from before a
@@ -211,10 +216,67 @@ impl McpClient {
         serde_json::from_value(tools.clone()).map_err(McpError::from)
     }
 
-    /// `tools/call`: call a single tool; returns the Value of the result field (hub-end lossless JSON).
+    /// Call one bridge tool, attaching the registered logical-session capability.
+    /// The first bridge_register gets a stable request UUID; its response stores the
+    /// returned agentSessionToken for every subsequent tool call on this client.
     pub async fn tools_call(&self, name: &str, arguments: Value) -> Result<Value> {
-        let params = json!({ "name": name, "arguments": arguments });
-        self.call("tools/call", Some(params)).await
+        let mut args = arguments
+            .as_object()
+            .cloned()
+            .ok_or_else(|| McpError::Protocol("tool arguments must be a JSON object".into()))?;
+        let current_token = self.agent_session_token.read().await.clone();
+        let self_unregister = name == "bridge_unregister" && !args.contains_key("peer");
+
+        if name == "bridge_register" {
+            // An explicit registrationRequestId means the caller is requesting a
+            // fresh/idempotent registration, so do not replace it with the old token.
+            if !args.contains_key("agentSessionToken") && !args.contains_key("registrationRequestId") {
+                if let Some(token) = current_token {
+                    args.insert("agentSessionToken".to_string(), Value::String(token));
+                } else {
+                    args.insert(
+                        "registrationRequestId".to_string(),
+                        Value::String(Uuid::new_v4().to_string()),
+                    );
+                }
+            }
+        } else {
+            let token = current_token.ok_or_else(|| {
+                McpError::Protocol("agentSessionToken is required; call bridge_register first".into())
+            })?;
+            // Never allow an arbitrary caller-supplied token to replace this client's
+            // registered capability.
+            args.insert("agentSessionToken".to_string(), Value::String(token));
+        }
+
+        let params = json!({ "name": name, "arguments": Value::Object(args) });
+        let raw = self.call("tools/call", Some(params)).await?;
+        let is_error = raw.get("isError").and_then(Value::as_bool).unwrap_or(false);
+        let result_text = raw
+            .get("content")
+            .and_then(Value::as_array)
+            .and_then(|items| items.first())
+            .and_then(|item| item.get("text"))
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+
+        if is_error && result_text.contains("agentSessionToken is invalid or expired") {
+            // A manager kick or explicit unregister revoked the capability. Do not
+            // silently rejoin; a later explicit bridge_register may acquire a new one.
+            self.agent_session_token.write().await.take();
+        } else if name == "bridge_register" && !is_error {
+            if let Some(token) = serde_json::from_str::<Value>(&result_text)
+                .ok()
+                .and_then(|value| value.get("agentSessionToken").and_then(Value::as_str).map(str::to_owned))
+            {
+                *self.agent_session_token.write().await = Some(token);
+            }
+        } else if self_unregister && !is_error {
+            self.agent_session_token.write().await.take();
+        }
+
+        Ok(raw)
     }
 
     /// Internal: send the request + handle Mcp-Session-Id + parse JSON-RPC.

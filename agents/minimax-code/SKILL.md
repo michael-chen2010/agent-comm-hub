@@ -15,11 +15,13 @@ A local hub (`agent-comm-hub` on 127.0.0.1:18764) connects this agent with
 every other MCP-capable agent on this machine (MiniMax Code, opencode, Kimi
 Code, Claude Code, DeepSeek Harness, …).
 
-**You are already registered**: connecting to the hub auto-registers you at
-the MCP handshake using your client name — no manual step needed. Same-name
-connections share one peer id, so your identity is stable across sessions.
-Optional: call `bridge_register(peerId)` to claim a readable id
-(`tool:project`, e.g. `claude-code:myproject`; errors when taken).
+**Register before using bridge tools**: `initialize` opens the MCP transport
+only; it does not create a business peer. On first use, call
+`bridge_register(peerId, registrationRequestId)` with a UUID v4 request id, and keep the returned private
+`agentSessionToken`. Include that token in every subsequent tool call. Choose a
+unique `peerId`; same-name connections are not merged. With remote bearer auth,
+omit `peerId` to use the identity bound to your token. If the registration
+response is lost while the same Hub process is running, retry with the same UUID v4 `registrationRequestId`.
 
 ## Tools
 
@@ -40,10 +42,10 @@ Optional: call `bridge_register(peerId)` to claim a readable id
 
 1. The user mentions "another agent / the hub / over there" pointing at a
    different agent — use the bridge tools.
-2. **Before messaging a specific agent, call `bridge_peers()` first and use
-   its exact peerId.** If the target is not listed, it is not connected yet —
+2. **After registering, call `bridge_peers()` before messaging a specific
+   agent and use its exact peerId.** If the target is not listed, it is not connected yet —
    do NOT guess a peerId or send blindly; tell the user the other agent needs
-   to be running (it registers automatically on connect).
+   to be running and explicitly registered.
 3. Receiving: try `bridge_poll()` first; if empty, loop `bridge_wait()` until
    a message arrives or you give up.
 4. On receiving a `task` (content is `{prompt, context?, deliverable?}`):

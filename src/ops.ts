@@ -4,6 +4,7 @@
  */
 
 import { execFileSync } from 'node:child_process'
+import { randomUUID } from 'node:crypto'
 import { request } from 'node:http'
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
@@ -36,12 +37,25 @@ export async function runStatus(options: StatusOptions = {}): Promise<StatusResu
   try {
     const headers: Record<string, string> = {}
     let id = 0
+    let agentSessionToken: string | undefined
     // Plain node:http instead of fetch: undici's keep-alive pool can race
     // process.exit() on Windows (libuv UV_HANDLE_CLOSING assertion). Each
     // probe request gets its own socket (agent: false) and a hard timeout,
     // so the process always exits cleanly.
     const rpc = async (method: string, params?: unknown): Promise<{ result?: { content?: Array<{ text?: string }>; [k: string]: unknown }; error?: { message?: string } }> => {
-      const body = JSON.stringify({ jsonrpc: '2.0', id: ++id, method, ...(params !== undefined ? { params } : {}) })
+      let outgoingParams = params
+      if (method === 'tools/call' && agentSessionToken !== undefined
+        && typeof params === 'object' && params !== null && !Array.isArray(params)) {
+        const call = params as { name?: unknown; arguments?: unknown }
+        if (call.name !== 'bridge_register') {
+          const args = typeof call.arguments === 'object' && call.arguments !== null && !Array.isArray(call.arguments)
+            ? { ...(call.arguments as Record<string, unknown>) }
+            : {}
+          if (args.agentSessionToken === undefined) args.agentSessionToken = agentSessionToken
+          outgoingParams = { ...call, arguments: args }
+        }
+      }
+      const body = JSON.stringify({ jsonrpc: '2.0', id: ++id, method, ...(outgoingParams !== undefined ? { params: outgoingParams } : {}) })
       const res = await new Promise<{ status: number; contentType: string; text: string; sessionId: string | undefined }>((resolve, reject) => {
         const req = request(url, {
           method: 'POST',
@@ -70,6 +84,16 @@ export async function runStatus(options: StatusOptions = {}): Promise<StatusResu
     const init = await rpc('initialize', { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: probeName, version: 'cli' } })
     if (init.error) return { ...notRunning, error: init.error.message }
     const version = ((init.result as { serverInfo?: { version?: string } })?.serverInfo?.version) ?? undefined
+    const registration = await rpc('tools/call', {
+      name: 'bridge_register',
+      arguments: { peerId: probeName, registrationRequestId: randomUUID() },
+    })
+    const registrationText = registration.result?.content?.[0]?.text
+    const registered = registrationText === undefined ? undefined : JSON.parse(registrationText) as { ok?: boolean; agentSessionToken?: string; error?: string }
+    if (registered?.ok !== true || typeof registered.agentSessionToken !== 'string') {
+      return { ...notRunning, error: registered?.error ?? 'hub registration failed: missing agentSessionToken' }
+    }
+    agentSessionToken = registered.agentSessionToken
     const call = await rpc('tools/call', { name: 'bridge_peers', arguments: {} })
     const text = call.result?.content?.[0]?.text
     const parsed = text ? JSON.parse(text) as { peers?: Array<{ id: string; connected: boolean; alias?: string }> } : { peers: [] }

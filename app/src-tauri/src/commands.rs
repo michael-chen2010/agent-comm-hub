@@ -75,7 +75,7 @@ pub(crate) fn apply_saved_config(cfg: &mut HubConfig, store: &Store) {
 }
 
 /// The peer id of this end (the desktop GUI) in the hub — the hub's default manager (managerPeers).
-/// clientInfo.name equals this id (the hub auto-registers by name; same-name connections attach N:1).
+/// clientInfo.name is metadata only; ensure_mcp_initialized explicitly registers this peer and caches agentSessionToken.
 /// Keep SELF_PEER_ID here in sync with src/lib/self.ts in the frontend.
 pub(crate) const SELF_PEER_ID: &str = "agent-hub-cli";
 
@@ -248,8 +248,7 @@ pub async fn hub_get_logs(state: State<'_, AppState>) -> CmdResult<Vec<LogLine>>
     Ok(state.hub.snapshot_logs().await)
 }
 
-/// Called once by the frontend after load: notifies the backend that "the frontend is ready",
-/// triggering the hub auto-start + MCP init.
+/// Called once by the frontend after load: starts the hub and establishes an explicitly registered MCP identity.
 #[tauri::command]
 pub async fn app_ready(app: AppHandle, state: State<'_, AppState>) -> CmdResult<HubStatus> {
     state.hub.attach_app(app.clone()).await;
@@ -297,11 +296,10 @@ async fn ensure_mcp_initialized(app: &AppHandle, state: &AppState, _status: &Hub
         .flatten()
         .map(|r| r.value)
         .filter(|v| !v.is_empty());
-    // clientInfo.name is directly the target peer id: the hub attaches same-name connections
-    // N:1 (no duplicate registration, no "peer already registered"). Historically it used
-    // "agent-comm-hub-cli" + an explicit bridge_register("agent-hub-cli") rename — a lazy
-    // reconnect created a second session whose rename failed, leaving both agent-comm-hub-cli
-    // and agent-hub-cli peers alive and logging duplicate "peer joined" on every init.
+    let remote_auth = auth_token.is_some();
+    // clientInfo.name is descriptive transport metadata only; it no longer creates a business
+    // peer. Every new/reconnected MCP client explicitly calls bridge_register below and retains
+    // the returned agentSessionToken. McpClient attaches that token to all later tools/call requests.
     let client = Arc::new(McpClient::new(
         &cfg.host,
         cfg.port,
@@ -330,18 +328,15 @@ async fn ensure_mcp_initialized(app: &AppHandle, state: &AppState, _status: &Hub
         log::warn!("MCP initialize failed after 15 attempts: {e}; agent-hub-cli will be unavailable");
         return;
     }
-    // Explicit bridge_register "agent-hub-cli" (auto-register already sanitizes clientInfo.name
-    // into a same-name peer; the explicit register is redundant but idempotent, ensuring the connection semantics).
-    //
-    // The receipt's `from` is the identity the HUB actually bound this session to.
-    // That is the only trustworthy answer to "who am I": `managerPeers` defaults to
-    // `agent-hub-cli`, so if the hub bound us to anything else the app silently loses
-    // roster powers and a 3s global-history poll, and its own messages show up under
-    // the wrong name. Check it here, on every (re)connect, and say so out loud.
-    match client.tools_call("bridge_register", json!({ "peerId": SELF_PEER_ID })).await {
+    // bridge_register is the sole business-identity acquisition step. Its receipt contains
+    // peerId and agentSessionToken; McpClient stores the token and adds it to subsequent calls.
+    // Check the actual peerId because managerPeers defaults to SELF_PEER_ID and a mismatch
+    // would lose roster powers and global-history access.
+    let registration_args = if remote_auth { json!({}) } else { json!({ "peerId": SELF_PEER_ID }) };
+    match client.tools_call("bridge_register", registration_args).await {
         Ok(raw) => match unwrap_tool_result(raw) {
             Ok(value) => {
-                let bound = value.get("from").and_then(|v| v.as_str()).unwrap_or("");
+                let bound = value.get("peerId").and_then(|v| v.as_str()).unwrap_or("");
                 if bound != SELF_PEER_ID {
                     log::warn!(
                         "self peer id check FAILED: the hub bound this session to '{bound}', not '{SELF_PEER_ID}'. \

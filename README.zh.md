@@ -41,7 +41,7 @@
 ## 亮点
 
 - **任意 agent,一份配置**：所有客户端指向同一个 `streamable-http` URL，无需两两接线
-- **可靠身份**：消息的 `from` 由 hub 从会话绑定注入，客户端无法伪造；重名被拒；MCP 握手即自动注册（客户端名 = peer id），无需手动步骤。每个 peer 带档案（客户端名/版本、显示别名），上下线与改名通过 SSE 实时推送
+- **可靠身份**：消息的 `from` 由 hub 根据已注册的逻辑会话注入，客户端无法伪造；重名 peer id 会被拒绝。MCP `initialize` 只建立传输会话；客户端必须显式调用 `bridge_register`，并在之后每次工具调用中携带返回的私有 `agentSessionToken`。每个 peer 带档案（客户端名/版本、显示别名），上下线与改名通过 SSE 实时推送
 - **轮询即实时**：`bridge_wait` 长轮询（默认 30s，服务端上限 60s）；离线 agent 的消息排队等它
 - **结构化会话**：`chat` / `task` / `notice` / `ack` 四类消息；回执自动路由回原发送者；`to: "all"` 广播
 - **herdr 硬控制**（可选）：装了 [herdr](https://herdr.dev) 终端运行时后，`bridge_agent_*` 工具能直接往对方终端打字——斜杠命令真实执行、等待基于真实 agent 状态（idle/working/blocked/done）、可读终端输出
@@ -108,7 +108,7 @@ agent 由 [`agents/registry.json`](agents/registry.json) 声明——新增 agen
 只需加一条注册表记录，不改代码。只动 `agent-hub` 这一个键、每个文件先备份、
 幂等可重跑。Claude Code 的 MCP 配置手动（见下）。
 
-**注册全自动**：agent 会话一启动，MCP 握手即完成注册（客户端名 = peer id），无需任何手动操作。可选：`bridge_register("工具名:项目名")` 换可读 id。
+**显式注册**：MCP `initialize` 只建立 HTTP/SSE 传输会话，不会创建业务 peer。客户端必须调用 `bridge_register({peerId, registrationRequestId: "<UUID v4>"})`，保存返回的 `agentSessionToken`，并在之后每次工具调用参数中携带它。若 Hub 进程仍在运行但注册响应丢失，重试时复用同一个 `registrationRequestId`。
 
 ### 4. 验证端点
 
@@ -165,7 +165,7 @@ agent-comm-hub service uninstall
 
 | 工具 | 作用 |
 |---|---|
-| `bridge_register(peerId)` | 认领/改名身份（连接即自动注册，此项可选用于可读 id） |
+| `bridge_register(peerId?, alias?)` | 显式创建或改名业务 peer；首次注册提供 UUID v4 格式的 `registrationRequestId` 并返回私有 `agentSessionToken`，后续每次工具调用都必须携带它。remote-auth 模式下 peer id 由 Bearer token 决定。 |
 | `bridge_unregister()` | 离开 hub（移除 peer、队列与绑定；之后保持离线直到显式注册） |
 | `bridge_chat(to, message)` | 发消息；`to: "all"` 广播 |
 | `bridge_task(to, prompt, context?, deliverable?)` | 派结构化任务 |
@@ -260,9 +260,9 @@ const hub = startHub({ port: 18764 }, console) // 返回 { hub, registry, server
 
 - `kind`：`chat` / `task` / `notice` / `ack`。`task` 内容为 `{prompt, context?, deliverable?}`；`ack` 内容为 `{status, note?}`——均 JSON 编码
 - `from` **由 hub 注入**（来自会话→peer 绑定），客户端无法设置
-- 每条连接有唯一 `Mcp-Session-Id`；绑定表记录 session → peerId；重名被拒
-- **自动注册**：握手（`initialize`）即用 `clientInfo` 名注册；**同名连接共享一个 peer id**（一个 agent 开多个会话身份稳定、信箱共享）。`bridge_register` 换可读 id；`bridge_unregister` 注销（无其他会话共享时才移除 peer）
-- **离线容忍**：消息排队（上限 `maxQueue`，满丢最旧）；hub 重启会清空全部绑定（agent 重连后自动重新注册）
+- `Mcp-Session-Id` 只标识 HTTP/SSE 传输会话，不作为业务身份；业务调用只认 `agentSessionToken` 参数。remote-auth 模式要求它与 Bearer 身份匹配；不同逻辑会话不会自动共享 peer id 或信箱。
+- **显式注册**：握手（`initialize`）只建立传输会话；调用 `bridge_register` 创建业务 peer，并保存返回的 `agentSessionToken`。每次后续工具调用都必须传入该 token；`bridge_unregister` 会撤销当前 token，之后需要重新注册。
+- **离线容忍**：消息排队（上限 `maxQueue`，满丢最旧）；hub 重启会清空内存中的逻辑令牌，agent 重连后必须显式调用 `bridge_register` 重新注册。
 - **在线语义**：`connected` = 最近 `connectedWindowMs`（默认 30s）内活跃 **或** SSE 通道存活——会话开着就显示在线，无需心跳；空闲 GC（默认 10 分钟）**不会**清理有活跃 SSE 的 peer，只回收真正断连的
 
 ## 安全
@@ -318,8 +318,8 @@ pnpm tauri:build      # 三平台安装包 (NSIS / MSI / dmg / AppImage / deb)
 |---|---|
 | agent 没有 `bridge_*` 工具 | hub 没跑——启动 `agent-comm-hub` 并重启 agent 会话 |
 | `unknown recipient: xxx` | 对方未注册（或用了别的 peerId）——先 `bridge_peers()` |
-| `not registered — call bridge_register` | 仅在显式注销后出现（正常连接会自动注册）；客户端没上报名字时会用 `agent` 兜底 |
-| `peer already registered by another connection` | 有人占了该 id——换个唯一 id（如 `工具:项目`）或重启 hub 清理 |
+| `not registered — call bridge_register` | `initialize` 不会创建业务 peer；先调用 `bridge_register`，再在每次后续工具调用中携带返回的 `agentSessionToken` |
+| `peer already registered by another connection` | 另一个逻辑会话已占用该 id；请选择唯一的 `peerId`（如 `工具:项目`），相同客户端名不再自动合并会话 |
 | 端口冲突 | 默认 18764 被占用时用 `--port` 换端口，并同步各 agent 配置 |
 | PowerShell 客户端中文乱码 | 响应头已带 `charset=utf-8`；发送时用 `[System.Text.Encoding]::UTF8.GetBytes(...)` |
 

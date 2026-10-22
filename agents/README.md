@@ -18,8 +18,7 @@ powershell -ExecutionPolicy Bypass -File install-all.ps1
 英文 SKILL 到各 agent 的技能目录。覆盖：mcode / opencode / kimi-code / Gemini CLI /
 Codex（TOML 追加）/ zcode（`mcp.servers`）。Claude Code 和 DSH 需手动（见下表）。
 
-接入即自动上线（MCP 握手时用客户端名注册，无需手动 register）；想要可读的 peerId
-可以让 agent 调一次 `bridge_register(peerId)`。
+接入后必须显式注册：`initialize` 只建立 MCP 传输会话；首次调用 `bridge_register(peerId, registrationRequestId)`，其中 `registrationRequestId` 必须是 UUID v4；保存返回的 `agentSessionToken`，之后每次工具调用都必须携带该 token。若同一 Hub 进程中注册响应丢失，复用同一个 `registrationRequestId` 重试。
 
 | Agent | 配置文件 | 片段 | Skill 位置 |
 |---|---|---|---|
@@ -46,5 +45,5 @@ mcode / claude / opencode 各开一个会话，问它们：
 
 - hub 没起 → agent 工具列表里没有 `bridge_*`（MCP 连接失败会在 agent 日志里报错）。
 - 端口被占（如 dsh-mcode-bridge 用了 18763）→ `--port` 换端口，并同步各 agent 配置。
-- agent 报 "not registered" → 先调 `bridge_register(peerId)`。
+- agent 报 "not registered" → 先调 `bridge_register(peerId, registrationRequestId)`（request id 使用 UUID v4），保存 `agentSessionToken`，后续每次工具调用都携带该 token。
 - 改完配置记得重启 agent 会话。

@@ -41,7 +41,7 @@ Zero runtime dependencies: the MCP streamable-http server is hand-rolled over `n
 ## Highlights
 
 - **Any agent, one config**: every client points at the same `streamable-http` URL — no per-pair wiring.
-- **Reliable identity**: the sender of every message is derived from the connection's session binding, never caller-supplied — peers cannot impersonate each other; duplicate ids are rejected. Connecting the MCP auto-registers your client name — no manual setup. Peers carry a profile (client name/version, display alias) and joins/leaves are pushed over SSE.
+- **Reliable identity**: the sender of every message is derived from the registered logical-session capability, never caller-supplied — peers cannot impersonate each other; duplicate ids are rejected. MCP `initialize` opens the transport only; each client must call `bridge_register` and send the returned private `agentSessionToken` with every later tool call. Peers carry a profile (client name/version, display alias) and joins/leaves are pushed over SSE.
 - **Real-time by polling**: `bridge_wait` long-polls (default 30 s, server ceiling 60 s); messages queue for offline peers.
 - **Structured conversations**: `chat` / `task` / `notice` / `ack` message kinds, acks auto-routed back to the original sender, `to: "all"` broadcast.
 - **Hard control via herdr** (optional): when the [herdr](https://herdr.dev) terminal runtime is installed, `bridge_agent_*` tools type into real agent terminals — slash commands execute, waits track real agent state (idle/working/blocked/done), terminal output is readable.
@@ -115,9 +115,8 @@ registry record, no code change. Only the `agent-hub` key is touched, every
 file is backed up first, and re-running is a no-op. Claude Code's MCP config
 stays manual (see below).
 
-**Registration is automatic**: once an agent session starts, the MCP handshake
-registers it with the hub (client name becomes the peer id) — no manual step.
-Optional: `bridge_register("tool:project")` for a readable id.
+**Registration is explicit**: the MCP handshake establishes transport only. Before
+using bridge tools, call `bridge_register({peerId:"tool:project", registrationRequestId:"<UUID v4>"})` to create your logical peer. Keep the returned `agentSessionToken` for every later bridge call.
 
 ### 4. Verify the endpoint
 
@@ -252,7 +251,7 @@ with `agent-comm-hub setup --remove` (or only refresh skills via
 
 | Tool | Purpose |
 |---|---|
-| `bridge_register(peerId, alias?)` | Claim or rename your identity (auto-registered at connect with the client name; optional for a readable id like `opencode:myproject`) |
+| `bridge_register(peerId?, alias?)` | Create or rename your logical peer. A first call uses a UUID v4 `registrationRequestId` and returns a private `agentSessionToken`; every later bridge call must carry that token. In remote-auth mode, the bearer token determines the peer id. |
 | `bridge_rename(alias?, peer?, peerId?)` | Set your own display alias; renaming or true-renaming **another** peer needs manager rights |
 | `bridge_unregister(peer?)` | Leave the hub (removes peer, queue, and session binding; stays off until an explicit register). With `peer`, kicks that peer (manager) |
 | `bridge_chat(to, message, threadId?, priority?, ref?, expiresAt?)` | Send a chat message; `to: "all"` broadcasts. `expiresAt` is an absolute epoch-ms deadline: a message still undelivered after it is dropped and counted, not delivered late. `priority` (0\|1\|2, default 0) orders the recipient's mailbox |
@@ -464,15 +463,9 @@ const hub = startHub({ port: 18764 }, console) // returns { hub, registry, serve
 
 - `kind`: `chat` | `task` | `notice` | `ack`. `task` content is `{prompt, context?, deliverable?}`; `ack` content is `{status, note?}` — both JSON-encoded.
 - `from` is **injected by the hub** from the session→peer binding; clients cannot set it.
-- Each connection gets a unique session capability. Standard MCP transports carry it in `Mcp-Session-Id`; if a transport drops headers, `hubSessionId` is included in the initialize instructions and accepted as an optional argument on every tool. Include it on every tool call in that mode. It is a private per-connection capability and must not be shared. The binding table maps session → peerId; duplicate peerIds are rejected.
-- **Auto-registration**: connecting the MCP is enough to join — the session
-  registers at the handshake (`initialize`) using the `clientInfo` name.
-  **Same-name connections share one peer id** (an agent that opens a new
-  session per chat keeps a stable identity and its sessions share the
-  mailbox). `bridge_register` upgrades the id to something readable;
-  `bridge_unregister` detaches (dropping the peer when no other session shares
-  it) and suppresses auto-registration until an explicit register.
-- Peers are offline-tolerant: messages queue (max `maxQueue`, oldest dropped) until the peer polls; a peer must re-register after its agent restarts (bindings are per-session and in-memory; restarting the hub clears everything).
+- The standard MCP `Mcp-Session-Id` header identifies the HTTP/SSE transport session only; it is not the business identity and is not an alternative to `agentSessionToken`. `bridge_register` creates the logical peer and returns a private `agentSessionToken`; every subsequent tool call must include it. If the first registration response is lost while the same Hub process is still running, retry with the same UUID v4 `registrationRequestId` to recover the same capability. Treat the token as secret and never share it. In remote-auth mode, it must match the bearer identity; duplicate peer ids are rejected.
+- **Explicit registration**: `initialize` creates only the HTTP/SSE transport session. Call `bridge_register` to create a business peer and keep its returned `agentSessionToken`; every later tool call must include it. Different logical sessions with the same `clientInfo.name` are independent and cannot share a peer id or mailbox. `bridge_unregister` revokes the token; the client must explicitly register again before making further business calls.
+- Peers are offline-tolerant: messages queue (max `maxQueue`, oldest dropped) until the peer polls. Logical tokens and transport bindings are in-memory; after a hub restart, the client must initialize and explicitly call `bridge_register` again.
 - **Liveness**: `connected` means activity within `connectedWindowMs` (default 30 s) **or** a live SSE channel — an open agent session stays online without heartbeat calls. The idle GC (default 10 min) never evicts a peer with a live SSE channel; only peers whose channel is gone are recycled, freeing their names.
 
 ## Security
@@ -486,7 +479,7 @@ const hub = startHub({ port: 18764 }, console) // returns { hub, registry, serve
 ```bash
 pnpm install
 pnpm typecheck        # tsc --noEmit (strict)
-pnpm test             # test suite (319 checks: 174 smoke + 46 setup + 11 ops + 35 herdr + 33 discover + 20 e2e)
+pnpm test             # test suite (321 checks: 176 smoke + 46 setup + 11 ops + 35 herdr + 33 discover + 20 e2e)
 npm run build:admin   # admin/ workspace (npm) → single-file assets/admin.html
 pnpm run build        # esbuild → lib/{cli,index,setup}.js (zero deps)
 pnpm pack             # build + npm pack (publishing artifact)
@@ -530,8 +523,8 @@ Tests cover registration, duplicate rejection, chat routing, sender-filtered wai
 |---|---|
 | Agent has no `bridge_*` tools | Hub not running — start `agent-comm-hub` and restart the agent session |
 | `unknown recipient: xxx` | The peer hasn't registered (or used a different peerId) — check `bridge_peers()` |
-| `not registered — call bridge_register` | Only appears after an explicit `bridge_unregister` (normal connections auto-register at connect); clients without a client name fall back to `agent` |
-| `peer already registered by another connection` | Another live connection holds the id — pick a unique peerId (e.g. `tool:project`) or restart the hub to clear stale bindings |
+| `not registered — call bridge_register` | `initialize` does not create a business peer. Call `bridge_register` first (provide `peerId` in loopback mode; remote-auth can derive it from the bearer token), then include the returned `agentSessionToken` in every later tool call |
+| `peer already registered by another connection` | Another logical session holds that id — choose a unique `peerId` (e.g. `tool:project`); same-name MCP connections are no longer merged automatically |
 | Port conflict | 18764 is the default; if it is taken, change with `--port` and update every agent config |
 | Chinese garbled in PowerShell clients | Response headers carry `charset=utf-8`; send request bodies as UTF-8 bytes (`[System.Text.Encoding]::UTF8.GetBytes(...)`) |
 

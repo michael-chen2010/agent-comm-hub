@@ -102,7 +102,7 @@
 
 ### 关键数据流
 
-**启动**：UI 启动 → Rust 端检查 127.0.0.1:18764 是否已在响应 → 否就 spawn hub 子进程 → 等端口就绪 → Rust mcp_client 建 MCP SSE 连接 + `initialize` 自动注册 `agent-hub-cli` peer → 前端订阅 store → 拉 peer 列表 + 最近 100 条消息 → UI 渲染。
+**启动**：UI 启动 → Rust 端检查 127.0.0.1:18764 是否已在响应 → 否就 spawn hub 子进程 → 等端口就绪 → Rust mcp_client 建 MCP SSE 连接并 `initialize` → 显式调用 `bridge_register` 创建 `agent-hub-cli` peer → 缓存返回的 `agentSessionToken` 并在每次后续工具调用中附加 → 前端订阅 store → 拉 peer 列表 + 最近 100 条消息 → UI 渲染。`Mcp-Session-Id` 仅用于 HTTP/SSE 传输。
 
 **收消息**：hub SSE 推 `notifications/message`（`params.data` 按事件分支，见下节）→ Rust mcp_client 解析 → 花名册/消息旁路写 SQLite → emit Tauri event `hub:peers` / `hub:message` → 前端 store 更新 → 消息流虚拟列表追加 → 托盘未读 +1。
 

@@ -2,7 +2,7 @@
 
 ## 0.10.1 (2026-10-22)
 
-- **Transport-compatible MCP session binding**: each initialize response now includes the per-connection `hubSessionId` in server instructions, and every tool schema accepts it as an optional argument. Clients whose transport drops `Mcp-Session-Id` can pass `hubSessionId` in each tool call; stale sessions, conflicting header/argument values, and remote-auth token/session mismatches remain rejected.
+- **Explicit logical-session capability**: `initialize` establishes only the MCP transport session. `bridge_register` returns a private `agentSessionToken`, which is required in every subsequent bridge tool call; `registrationRequestId` makes first registration retry-safe. The standard `Mcp-Session-Id` header remains transport-only for HTTP/SSE and never selects the business peer. Remote Bearer identity is validated independently against both the transport session and logical capability.
 
 ## 0.10.0 (2026-10-11)
 

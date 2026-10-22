@@ -9,6 +9,7 @@
  */
 
 import { startHub } from './entry.mjs'
+import { randomUUID } from 'node:crypto'
 import { tmpdir } from 'node:os'
 import { readFileSync, rmSync, writeFileSync, existsSync } from 'node:fs'
 
@@ -56,23 +57,34 @@ function makeClient(name, base = BASE, token, options = {}) {
   const sessionMode = options.sessionMode ?? 'header'
   let sessionId
   let initializeResult
+  let agentSessionToken
   let id = 0
-  return {
+  const parseToolResult = async (tool, args) => {
+    const r = await client.rpc('tools/call', { name: tool, arguments: args ?? {} })
+    const text = r.json?.result?.content?.[0]?.text
+    const parsed = JSON.parse(text ?? '{}')
+    assertLosslessJson(parsed)
+    if (tool === 'bridge_unregister' && args?.peer === undefined && r.json?.result?.isError !== true) {
+      agentSessionToken = undefined
+    }
+    return { r, text, parsed }
+  }
+  const client = {
     name,
     sessionId: () => sessionId,
+    agentSessionToken: () => agentSessionToken,
     instructions: () => initializeResult?.instructions,
     async rpc(method, params) {
       const outgoingHeaders = { 'Content-Type': 'application/json', Accept: 'application/json, text/event-stream', ...headers }
       let outgoingParams = params
-      if (sessionMode === 'argument') {
-        delete outgoingHeaders['Mcp-Session-Id']
-        if (method === 'tools/call' && sessionId !== undefined) {
-          outgoingParams = {
-            ...params,
-            arguments: { ...(params?.arguments ?? {}), hubSessionId: sessionId },
-          }
+      if (method === 'tools/call' && params !== undefined) {
+        const args = { ...(params.arguments ?? {}) }
+        if (args.agentSessionToken === undefined && agentSessionToken !== undefined) {
+          args.agentSessionToken = agentSessionToken
         }
+        outgoingParams = { ...params, arguments: args }
       }
+      if (sessionMode === 'argument') delete outgoingHeaders['Mcp-Session-Id']
       const res = await fetch(base, {
         method: 'POST',
         headers: outgoingHeaders,
@@ -91,33 +103,49 @@ function makeClient(name, base = BASE, token, options = {}) {
     async init() {
       const r = await this.rpc('initialize', { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: this.name, version: '1' } })
       initializeResult = r.json?.result
-      if (sessionMode === 'argument') {
-        sessionId = initializeResult?.instructions?.match(/hubSessionId is ([^.]+)\./)?.[1]
-      }
       if (r.json?.result?.protocolVersion !== '2025-06-18') throw new Error(`${this.name} initialize failed: ${r.text}`)
       await this.rpc('notifications/initialized')
+      if (options.autoRegister !== false) {
+        const peerId = options.registerPeerId ?? (token === undefined ? this.name : undefined)
+        const registered = await this.register(peerId, options.registerAlias)
+        if (registered.error !== undefined || typeof registered.agentSessionToken !== 'string') {
+          throw new Error(`${this.name} initial bridge_register failed: ${JSON.stringify(registered)}`)
+        }
+      }
     },
     /** Call a bridge tool; returns the parsed result object, asserting lossless JSON. */
     async call(tool, args) {
-      const r = await this.rpc('tools/call', { name: tool, arguments: args ?? {} })
-      const text = r.json?.result?.content?.[0]?.text
-      const parsed = JSON.parse(text ?? '{}')
-      assertLosslessJson(parsed)
+      const { r, text, parsed } = await parseToolResult(tool, args)
       if (r.json?.result?.isError) throw new Error(`${this.name} ${tool}: ${text}`)
       return parsed
     },
     /** Like call, but returns the parsed result even for error results. */
     async callRaw(tool, args) {
-      const r = await this.rpc('tools/call', { name: tool, arguments: args ?? {} })
-      const text = r.json?.result?.content?.[0]?.text
-      const parsed = JSON.parse(text ?? '{}')
-      assertLosslessJson(parsed)
+      const { parsed } = await parseToolResult(tool, args)
       return parsed
     },
-    async register(peerId) {
-      return this.call('bridge_register', { peerId })
+    async register(peerId, alias) {
+      const args = {
+        ...(peerId !== undefined ? { peerId } : {}),
+        ...(alias !== undefined ? { alias } : {}),
+        ...(agentSessionToken !== undefined
+          ? { agentSessionToken }
+          : { registrationRequestId: randomUUID() }),
+      }
+      let result = await this.callRaw('bridge_register', args)
+      if (result.error !== undefined && /invalid or expired/.test(result.error) && agentSessionToken !== undefined) {
+        agentSessionToken = undefined
+        result = await this.callRaw('bridge_register', {
+          ...(peerId !== undefined ? { peerId } : {}),
+          ...(alias !== undefined ? { alias } : {}),
+          registrationRequestId: randomUUID(),
+        })
+      }
+      if (result.ok === true && typeof result.agentSessionToken === 'string') agentSessionToken = result.agentSessionToken
+      return result
     },
   }
+  return client
 }
 
 const hub = startHub({ port: PORT, waitTimeoutMs: 3000, maxQueue: 20, historyLimit: 50, managerPeers: ['mavis'] }, { info: () => {}, warn: () => {} })
@@ -331,72 +359,94 @@ try {
   const badStatus = await mavis.callRaw('bridge_ack', { ref: 'does-not-exist', status: 'done' })
   check('ack of unknown ref rejected', badStatus.error !== undefined, JSON.stringify(badStatus))
 
-  console.log('== auto-registration ==')
-  const auto = makeClient('autobot')
+  console.log('== explicit registration and independent logical sessions ==')
+  const auto = makeClient('autobot', BASE, undefined, { autoRegister: false })
   await auto.init()
-  const autoPeers = await auto.call('bridge_peers') // first tool call auto-registers
-  check('auto-register on first tool call', autoPeers.peers.some(p => p.id === 'autobot'), JSON.stringify(autoPeers))
+  const beforeRegister = await mavis.call('bridge_peers')
+  check('initialize alone does not register a business peer', !beforeRegister.peers.some(p => p.id === 'autobot'), JSON.stringify(beforeRegister))
+  const autoRegistered = await auto.register('autobot')
+  check('bridge_register explicitly creates the peer and returns its capability', autoRegistered.ok === true && auto.agentSessionToken() !== undefined, JSON.stringify(autoRegistered))
   const renamed = await auto.register('autobot:proj')
-  check('explicit register renames auto id', renamed.peers.includes('autobot:proj') && !renamed.peers.includes('autobot'), JSON.stringify(renamed))
-  const dup1 = makeClient('dupname')
-  const dup2 = makeClient('dupname')
+  check('explicit register renames the existing logical session', renamed.peers.includes('autobot:proj') && !renamed.peers.includes('autobot'), JSON.stringify(renamed))
+  const dup1 = makeClient('dupname', BASE, undefined, { autoRegister: false })
+  const dup2 = makeClient('dupname', BASE, undefined, { autoRegister: false })
   await dup1.init()
   await dup2.init()
-  await dup1.call('bridge_peers')
-  await dup2.call('bridge_peers')
+  await dup1.register('dupname-one')
+  await dup2.register('dupname-two')
   const dupPeers = await auto.call('bridge_peers')
   const dupIds = dupPeers.peers.map(p => p.id).filter(id => id.startsWith('dupname'))
-  check('same-name sessions share one peer id', JSON.stringify(dupIds) === JSON.stringify(['dupname']), JSON.stringify(dupIds))
-  // Shared mailbox: dup1 sends to its own shared peer, dup2 (same name) receives.
-  await dup1.call('bridge_chat', { to: 'dupname', message: 'shared mailbox ping' })
-  const shared = await dup2.call('bridge_wait', { timeoutMs: 3000 })
-  check('same-name sessions share the mailbox', shared.type === 'message' && shared.message.content === 'shared mailbox ping', JSON.stringify(shared))
+  check('same client name can hold independent explicitly named peers', JSON.stringify(dupIds.sort()) === JSON.stringify(['dupname-one', 'dupname-two']), JSON.stringify(dupIds))
+  await mavis.call('bridge_chat', { to: 'dupname-one', message: 'private logical mailbox ping' })
+  const firstMailbox = await dup1.call('bridge_poll')
+  const secondMailbox = await dup2.call('bridge_poll')
+  check('logical sessions do not share mailboxes', firstMailbox.messages.some(m => m.content === 'private logical mailbox ping') && secondMailbox.messages.length === 0, JSON.stringify({ firstMailbox, secondMailbox }))
   const explicitLeave = makeClient('leaver')
   await explicitLeave.init()
-  await explicitLeave.call('bridge_peers')
   await explicitLeave.call('bridge_unregister')
   const left = await explicitLeave.callRaw('bridge_chat', { to: 'mavis', message: 'x' })
-  check('unregister suppresses re-auto-register', left.error !== undefined, JSON.stringify(left))
+  check('unregister revokes the logical session capability', left.error !== undefined, JSON.stringify(left))
 
-  console.log('== eager registration at connect ==')
-  const eager = makeClient('eager') // initialize ONLY — no tool calls at all
-  await eager.init()
-  const eagerPeers = await mavis.call('bridge_peers')
-  check('peer appears after initialize alone', eagerPeers.peers.some(p => p.id === 'eager' && p.connected === true), JSON.stringify(eagerPeers))
-  const de1 = makeClient('dupeager')
-  const de2 = makeClient('dupeager')
-  await de1.init()
-  await de2.init()
-  const dePeers = await mavis.call('bridge_peers')
-  const deIds = dePeers.peers.map(p => p.id).filter(id => id.startsWith('dupeager'))
-  check('connect-time same-name sessions merge into one peer', JSON.stringify(deIds) === JSON.stringify(['dupeager']), JSON.stringify(deIds))
-
-  console.log('== session id in tool arguments ==')
-  const argOnly = makeClient('paramonly', BASE, undefined, { sessionMode: 'argument' })
+  console.log('== explicit logical session token ==')
+  const argOnly = makeClient('paramonly', BASE, undefined, { sessionMode: 'argument', autoRegister: false })
   await argOnly.init()
   check(
-    'initialize instructions expose hubSessionId for argument-only transports',
-    typeof argOnly.sessionId() === 'string' && argOnly.instructions()?.includes(argOnly.sessionId()),
-    JSON.stringify({ sessionId: argOnly.sessionId(), instructions: argOnly.instructions() }),
+    'initialize instructions do not expose a business session id',
+    !/hubSessionId/.test(argOnly.instructions() ?? '') && /agentSessionToken/.test(argOnly.instructions() ?? ''),
+    JSON.stringify({ instructions: argOnly.instructions() }),
   )
   const listed = await argOnly.rpc('tools/list')
   const peersTool = listed.json?.result?.tools?.find(tool => tool.name === 'bridge_peers')
   check(
-    'tools/list exposes hubSessionId as an optional argument',
-    peersTool?.inputSchema?.properties?.hubSessionId?.type === 'string',
+    'tools/list requires agentSessionToken for business tools',
+    peersTool?.inputSchema?.properties?.agentSessionToken?.type === 'string'
+      && peersTool?.inputSchema?.required?.includes('agentSessionToken') === true
+      && peersTool?.inputSchema?.properties?.hubSessionId === undefined,
     JSON.stringify(peersTool?.inputSchema),
   )
-  const paramReg = await argOnly.callRaw('bridge_register', { peerId: 'paramonly-renamed' })
+  const registerTool = listed.json?.result?.tools?.find(tool => tool.name === 'bridge_register')
   check(
-    'tool call resolves session from hubSessionId when header is omitted',
-    paramReg.ok === true && paramReg.peerId === 'paramonly-renamed',
-    JSON.stringify(paramReg),
+    'bridge_register schema requires either a first-registration UUID or an existing token',
+    registerTool?.inputSchema?.properties?.registrationRequestId?.format === 'uuid'
+      && registerTool?.inputSchema?.properties?.registrationRequestId?.pattern?.includes('-4[0-9a-fA-F]{3}-') === true
+      && registerTool?.inputSchema?.anyOf?.some(branch => branch.required?.includes('registrationRequestId')) === true
+      && registerTool?.inputSchema?.anyOf?.some(branch => branch.required?.includes('agentSessionToken')) === true,
+    JSON.stringify(registerTool?.inputSchema),
   )
-  const mismatch = await mavis.rpc('tools/call', { name: 'bridge_peers', arguments: { hubSessionId: 'wrong-session' } })
+  const noHeaderRpc = async (method, params) => {
+    const response = await fetch(BASE, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Accept: 'application/json, text/event-stream' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 901, method, ...(params !== undefined ? { params } : {}) }),
+    })
+    return { status: response.status, json: await response.json() }
+  }
+  const requestId = crypto.randomUUID()
+  const regWithoutHeader = await noHeaderRpc('tools/call', {
+    name: 'bridge_register', arguments: { peerId: 'paramonly-renamed', registrationRequestId: requestId },
+  })
+  const regResult = JSON.parse(regWithoutHeader.json?.result?.content?.[0]?.text ?? '{}')
   check(
-    'conflicting header and hubSessionId are rejected',
-    mismatch.json?.error?.code === -32602,
-    JSON.stringify(mismatch.json),
+    'bridge_register creates a logical session without relying on the HTTP session header',
+    regResult.ok === true && regResult.peerId === 'paramonly-renamed'
+      && typeof regResult.agentSessionToken === 'string' && regResult.agentSessionToken.length >= 32,
+    JSON.stringify(regResult),
+  )
+  const peersWithToken = await noHeaderRpc('tools/call', {
+    name: 'bridge_peers', arguments: { agentSessionToken: regResult.agentSessionToken },
+  })
+  check(
+    'subsequent tool calls resolve the registered logical session from its token',
+    peersWithToken.json?.result?.isError !== true
+      && JSON.parse(peersWithToken.json?.result?.content?.[0]?.text ?? '{}').peers?.some(p => p.id === 'paramonly-renamed') === true,
+    JSON.stringify(peersWithToken.json),
+  )
+  const peersWithoutToken = await noHeaderRpc('tools/call', { name: 'bridge_peers', arguments: {} })
+  const missingTokenResult = JSON.parse(peersWithoutToken.json?.result?.content?.[0]?.text ?? '{}')
+  check(
+    'business tool calls without agentSessionToken are rejected',
+    peersWithoutToken.json?.result?.isError === true && /agentSessionToken/.test(missingTokenResult.error ?? ''),
+    JSON.stringify(missingTokenResult),
   )
 
   console.log('== liveness semantics (SSE counts as connected) ==')
@@ -421,24 +471,28 @@ try {
   }
 
   console.log('== idle GC evicts ghosts ==')
-  const hubGc = startHub({ port: 19000, peerIdleTimeoutMs: 700, connectedWindowMs: 60_000, waitTimeoutMs: 2000, maxQueue: 10, historyLimit: 10 }, { info: () => {}, warn: () => {} })
+  const hubGc = startHub({ port: 19000, peerIdleTimeoutMs: 700, connectedWindowMs: 60_000, sessionTtlMs: 0, waitTimeoutMs: 2000, maxQueue: 10, historyLimit: 10 }, { info: () => {}, warn: () => {} })
   try {
     const ghost = makeClient('gcpear', 'http://127.0.0.1:19000/mcp')
     const checkerGc = makeClient('checker3', 'http://127.0.0.1:19000/mcp')
     await ghost.init()
     await checkerGc.init()
+    const checkerGcSse = await fetch('http://127.0.0.1:19000/mcp', { headers: { Accept: 'text/event-stream', 'Mcp-Session-Id': checkerGc.sessionId() } })
+    const checkerGcReader = checkerGcSse.body.getReader()
+    await checkerGcReader.read() // keep the checker connected while the target idles out
     const before = await checkerGc.call('bridge_peers')
     check('peer registered before GC', before.peers.some(p => p.id === 'gcpear'), JSON.stringify(before))
     await new Promise(resolve => setTimeout(resolve, 2200)) // idle 700ms + 1s GC interval
     const after = await checkerGc.call('bridge_peers')
-    // W7: the idle GC parks a peer instead of forgetting it — it disappears from
-    // the "connected" set but stays addressable and keeps whatever was queued.
+    // Idle GC detaches the peer id but retains its mailbox until parkedTtlMs.
     const parkedGc = after.peers.find(p => p.id === 'gcpear')
     check('idle peer is parked by GC (gone quiet, still listed)', parkedGc !== undefined && parkedGc.reachable === 'parked' && parkedGc.connected === false, JSON.stringify(after))
     const toParked = await checkerGc.call('bridge_chat', { to: 'gcpear', message: 'queued while you were away' })
     check('a parked peer is still addressable', toParked.ok === true, JSON.stringify(toParked))
-    const rejoined = await ghost.call('bridge_peers') // next call re-auto-registers
-    check('evicted session re-registers on next call', rejoined.peers.some(p => p.id === 'gcpear'), JSON.stringify(rejoined))
+    const rejoined = await ghost.register('gcpear')
+    check('idle session explicitly re-registers with its existing capability', rejoined.ok === true && rejoined.peerId === 'gcpear', JSON.stringify(rejoined))
+    const resumed = await ghost.call('bridge_poll')
+    check('queued mailbox survives explicit re-registration', resumed.messages.some(m => m.content === 'queued while you were away'), JSON.stringify(resumed))
 
     // A peer with a live SSE channel must survive the idle GC (open session = online).
     const liveGc = makeClient('livegc', 'http://127.0.0.1:19000/mcp')
@@ -511,7 +565,7 @@ try {
     check('kicked session cannot auto-re-register', bobBlocked.error !== undefined, JSON.stringify(bobBlocked))
     const roster4 = await mgr.call('bridge_peers')
     check('kicked peer leaves the roster', !roster4.peers.some(p => p.id === 'bob'), JSON.stringify(roster4))
-    const bobBack = await bob.call('bridge_register', { peerId: 'bob' })
+    const bobBack = await bob.register('bob')
     check('kicked peer can explicitly re-register', bobBack.ok === true, JSON.stringify(bobBack))
 
     const kickUnknown = await mgr.call('bridge_unregister', { peer: 'nobody-here' })
@@ -726,9 +780,9 @@ try {
     const argumentSessionHijack = await fetch(authBase, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Accept: 'application/json, text/event-stream', Authorization: 'Bearer ls-token-0123456789abcdef' },
-      body: JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'bridge_peers', arguments: { hubSessionId: zs.sessionId() } } }),
+      body: JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'bridge_peers', arguments: { agentSessionToken: zs.agentSessionToken() } } }),
     })
-    check('argument session id cannot be used with another token', argumentSessionHijack.status === 401, String(argumentSessionHijack.status))
+    check('logical session token cannot be used with another bearer identity', argumentSessionHijack.status === 401, String(argumentSessionHijack.status))
 
     // The R0 leak, closed: one token user's message must NOT reach another's mailbox.
     await zs.call('bridge_chat', { to: 'zhangsan', message: '张三的交接任务' })

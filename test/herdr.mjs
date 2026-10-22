@@ -9,6 +9,7 @@
  *   node test/herdr.mjs
  */
 
+import { randomUUID } from 'node:crypto'
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -55,7 +56,37 @@ function assertLosslessJson(value, path = 'root') {
 function makeClient(name, base = BASE) {
   const headers = {}
   let id = 0
-  return {
+  let agentSessionToken
+  const prepareArgs = (tool, args) => {
+    const prepared = { ...(args ?? {}) }
+    if (tool === 'bridge_register') {
+      if (prepared.agentSessionToken === undefined && prepared.registrationRequestId === undefined) {
+        if (agentSessionToken !== undefined) prepared.agentSessionToken = agentSessionToken
+        else prepared.registrationRequestId = randomUUID()
+      }
+    } else {
+      if (agentSessionToken === undefined) throw new Error(`${name} ${tool}: call bridge_register first`)
+      prepared.agentSessionToken = agentSessionToken
+    }
+    return prepared
+  }
+  const callRaw = async (tool, args) => {
+    const prepared = prepareArgs(tool, args)
+    const r = await client.rpc('tools/call', { name: tool, arguments: prepared })
+    const text = r.json?.result?.content?.[0]?.text
+    const parsed = JSON.parse(text ?? '{}')
+    assertLosslessJson(parsed)
+    const isError = r.json?.result?.isError === true
+    if (isError && typeof parsed.error === 'string' && parsed.error.includes('agentSessionToken is invalid or expired')) {
+      agentSessionToken = undefined
+    } else if (!isError && tool === 'bridge_register' && typeof parsed.agentSessionToken === 'string') {
+      agentSessionToken = parsed.agentSessionToken
+    } else if (!isError && tool === 'bridge_unregister' && prepared.peer === undefined) {
+      agentSessionToken = undefined
+    }
+    return { isError, parsed, text }
+  }
+  const client = {
     name,
     async rpc(method, params) {
       const res = await fetch(base, {
@@ -76,24 +107,16 @@ function makeClient(name, base = BASE) {
       await this.rpc('notifications/initialized')
     },
     async call(tool, args) {
-      const r = await this.rpc('tools/call', { name: tool, arguments: args ?? {} })
-      const text = r.json?.result?.content?.[0]?.text
-      const parsed = JSON.parse(text ?? '{}')
-      assertLosslessJson(parsed)
-      if (r.json?.result?.isError) throw new Error(`${this.name} ${tool}: ${text}`)
-      return parsed
+      const result = await callRaw(tool, args)
+      if (result.isError) throw new Error(`${this.name} ${tool}: ${result.text}`)
+      return result.parsed
     },
-    async callRaw(tool, args) {
-      const r = await this.rpc('tools/call', { name: tool, arguments: args ?? {} })
-      const text = r.json?.result?.content?.[0]?.text
-      const parsed = JSON.parse(text ?? '{}')
-      assertLosslessJson(parsed)
-      return { isError: r.json?.result?.isError === true, parsed, text }
-    },
+    callRaw,
     async register(peerId) {
       return this.call('bridge_register', { peerId })
     },
   }
+  return client
 }
 
 const tmp = mkdtempSync(join(tmpdir(), 'herdr-test-'))

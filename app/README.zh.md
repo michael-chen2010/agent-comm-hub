@@ -38,7 +38,7 @@ pnpm tauri:build    # 三平台安装包 (NSIS / dmg / AppImage+deb)
    - `node <主仓根>/lib/cli.js` (dev 场景 `current_exe()` 向上找主仓)
    - `npx agent-comm-hub` (兜底;首次启动会下载)
 3. 端口就绪探测(10s 预算,100ms 一次)
-4. `McpClient::initialize` → 自动注册 `agent-hub-cli` peer
+4. `McpClient::initialize` 建立传输会话 → 显式 `bridge_register` 创建 `agent-hub-cli` peer → 缓存 `agentSessionToken`，后续每次工具调用自动附加该 token
 5. `McpClient::subscribe_notifications` 开 SSE 长连接 — 这就是 hub 把 session 视为 "live" 的信号,跟 `bridge_wait` long-poll 同等地位
 
 ## 配置

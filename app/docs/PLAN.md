@@ -18,7 +18,7 @@
 | T-1.5 SQLite schema + 迁移 | `app/src-tauri/src/sqlite_store.rs` | 启动自动建表；migration 编号 v1 |
 | T-1.6 Rust MCP 客户端 | `app/src-tauri/src/mcp_client.rs` | `initialize` + `tools/list` + `tools/call` + SSE 监听 |
 | T-1.7 前端 peer 列表 | `app/src/views/PeersView.tsx`, `app/src/stores/peersStore.ts` | `bridge_peers` 拉取 + 实时更新 |
-| T-1.8 UI peer `agent-hub-cli` 自动注册 | `mcp_client.rs` 启动时 `initialize` 后 `tools/call bridge_register "agent-hub-cli"` | hub 内可见 `agent-hub-cli` peer |
+| T-1.8 UI peer `agent-hub-cli` 显式注册 | `mcp_client.rs` 启动时 `initialize` 后调用 `bridge_register(peerId, registrationRequestId)`，缓存返回的 `agentSessionToken` 并在后续工具调用中附加 | hub 内可见 `agent-hub-cli` peer，后续工具调用均携带有效 token |
 | T-1.9 三栏骨架（无详情） | `app/src/App.tsx` 路由布局 | 三栏可见，peer 选中态生效 |
 | T-1.10 smoke 测试 | `app/tests/m1-smoke.test.ts` | 双击 → 看到 hub 启动 + peer 列表填充 |
 

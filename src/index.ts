@@ -10,7 +10,6 @@
  */
 
 import { createServer, type IncomingMessage, type Server } from 'node:http'
-import { randomBytes, randomUUID } from 'node:crypto'
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { HerdrCtl } from './herdr-ctl.js'
@@ -318,12 +317,17 @@ export function startHub(config: Partial<HubConfig> = {}, log: HubLogger = conso
   /** Give a queued message's recipient sessions a push hint so UIs can skip
    * polling; delivery itself stays via bridge_wait / bridge_poll. */
   const pushQueued = (message: BridgeMessage, target: string): void => {
-    // Delivery is unchanged; this is only the skip-polling hint, and
-    // bridge_poll / bridge_wait still work if it is missed.
-    mcp.notify(oneStreamPer(`peer:${target}`, registry.sessionsForPeer(target)), SSE_METHOD, {
+    // The stream is transport-scoped, not agent-scoped. If several logical AI
+    // sessions share one transport, send only a generic hint to avoid leaking
+    // the recipient's message body to the other AI on that stream.
+    const streams = oneStreamPer(`peer:${target}`, registry.transportSessionsForPeer(target))
+    const sharedTransport = streams.some(id => registry.agentSessionsForTransport(id).length > 1)
+    mcp.notify(streams, SSE_METHOD, {
       level: 'info',
       logger: 'bridge',
-      data: { event: SSE_EVENT_MESSAGE, message: present(message) },
+      data: sharedTransport
+        ? { event: SSE_EVENT_MESSAGE, hint: true }
+        : { event: SSE_EVENT_MESSAGE, message: present(message) },
     })
   }
   /** Manager surface for the relay view. MUST use the same predicate as the
@@ -337,11 +341,16 @@ export function startHub(config: Partial<HubConfig> = {}, log: HubLogger = conso
    * app's existing `{event:'message', message}` consumer picks it up. */
   const pushRelay = (message: BridgeMessage): void => {
     const managers: string[] = []
-    for (const sessionId of registry.liveSessions()) {
+    for (const transportId of registry.liveSessions()) {
+      const agents = registry.agentSessionsForTransport(transportId)
+      // A shared transport stream cannot safely receive the manager's full relay:
+      // every AI attached to it could see the same event payload.
+      if (agents.length !== 1) continue
+      const sessionId = agents[0]!
       const peer = registry.peerFor(sessionId)
       if (peer === undefined) continue
       if (isManagerCaller(registry, sessionId, peer, { managerPeers: managerSet, managerTokenRequired: managerToken !== undefined })) {
-        managers.push(sessionId)
+        managers.push(transportId)
       }
     }
     if (managers.length > 0) {
@@ -583,8 +592,8 @@ export function startHub(config: Partial<HubConfig> = {}, log: HubLogger = conso
   runnerRegistry = new RunnerRegistry(resolved.runners ?? [], { herdr })
   if (runnerRegistry.size > 0) log.info(`runners configured for: ${runnerRegistry.peers().join(', ')}`)
   // Remote auth: token file -> per-request bearer lookup. The transport
-  // authenticates EVERY request; initialize additionally binds the session
-  // to the token identity, which then decides auto-registration (hub-tools).
+  // authenticates EVERY request; bridge_register binds the bearer identity to
+  // the logical agentSessionToken, never to the shared MCP transport session.
   let auth: ((req: IncomingMessage) => TokenIdentity | undefined) | undefined
   let authReload: (() => void) | undefined
   if (resolved.authTokens !== undefined) {
@@ -598,9 +607,8 @@ export function startHub(config: Partial<HubConfig> = {}, log: HubLogger = conso
     auth = req => {
       const presented = bearerFromHeaders(req.headers)
       if (presented !== undefined) return table.authenticate(presented)
-      // allow-join: anonymous walk-in gets the ANON sentinel here; the real
-      // unique id is minted PER SESSION at initialize (see onInitialize) —
-      // IP-keyed ids would merge two walk-ins behind one NAT/loopback.
+      // allow-join: anonymous walk-ins receive a sentinel on each request.
+      // bridge_register derives a stable unique peer id from its random UUID v4 request id.
       if (resolved.allowJoin === true) {
         return { peer: ANON_JOIN_PEER, role: 'agent', anonymous: true }
       }
@@ -626,27 +634,9 @@ export function startHub(config: Partial<HubConfig> = {}, log: HubLogger = conso
     registry,
     message => log.warn(message),
     (sessionId, clientName, clientVersion) => {
-      // Eager auto-registration at MCP handshake: connecting = joining.
-      try {
-        // Anonymous walk-in: mint a SESSION-UNIQUE peer id now (two kimi-code
-        // walk-ins on one NAT/loopback must never share a peer — R0 cross-talk (mailbox leak).
-        const identity = registry.tokenFor(sessionId)
-        if (identity?.anonymous === true && identity.peer === ANON_JOIN_PEER) {
-          let candidate = `join-${sanitizePeerId(clientName ?? 'agent')}-${randomBytes(2).toString('hex')}`
-          while (hub.has(candidate)) {
-            candidate = `join-${sanitizePeerId(clientName ?? 'agent')}-${randomBytes(2).toString('hex')}`
-          }
-          registry.bindToken(sessionId, { ...identity, peer: candidate })
-        }
-        const peer = autoRegisterPeer(hub, registry, sessionId, clientName, clientVersion)
-        if (peer !== undefined) {
-          const owner = registry.tokenFor(sessionId)?.owner
-          const anon = registry.tokenFor(sessionId)?.anonymous === true ? ' (anonymous join)' : ''
-          log.info(`peer joined: ${peer}${owner !== undefined ? ` (owner: ${owner})` : ''}${anon}`)
-        }
-      } catch (error) {
-        log.warn(`auto-register failed: ${(error as Error).message}`)
-      }
+      // Initialize establishes only the MCP transport. Business identity is
+      // claimed later by bridge_register and carried by agentSessionToken.
+      log.info(`MCP transport initialized: ${clientName ?? 'unnamed'}${clientVersion !== undefined ? `@${clientVersion}` : ''}`)
     },
     auth,
     authTokensAdmin(resolved.authTokens, authReload),

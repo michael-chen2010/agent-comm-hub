@@ -76,36 +76,60 @@ interface JsonRpcRequest {
   params?: unknown
 }
 
-function toolArgumentHubSessionId(message: JsonRpcRequest): unknown {
-  if (message.method !== 'tools/call') return undefined
-  const params = message.params
-  if (typeof params !== 'object' || params === null || Array.isArray(params)) return undefined
-  const args = (params as { arguments?: unknown }).arguments
-  if (typeof args !== 'object' || args === null || Array.isArray(args)) return undefined
-  return (args as Record<string, unknown>).hubSessionId
-}
+const REGISTRATION_REQUEST_ID = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$/
 
-function inputSchemaWithHubSessionId(schema: Record<string, unknown>): Record<string, unknown> {
+function inputSchemaWithAgentSessionToken(schema: Record<string, unknown>, toolName: string): Record<string, unknown> {
   const value = schema.properties
   const properties = typeof value === 'object' && value !== null && !Array.isArray(value)
     ? value as Record<string, unknown>
     : {}
+  const originalRequired = Array.isArray(schema.required)
+    ? schema.required.filter((item): item is string => typeof item === 'string')
+    : []
+  const agentSessionToken = {
+    type: 'string',
+    minLength: 36,
+    description: 'Required logical Hub session capability returned by bridge_register. Pass the exact token returned for this AI on every tool call; never reuse another AI connection\'s token.',
+  }
+  if (toolName === 'bridge_register') {
+    return {
+      ...schema,
+      required: originalRequired.filter(item => item !== 'peerId'),
+      properties: {
+        ...properties,
+        agentSessionToken,
+        registrationRequestId: {
+          type: 'string',
+          format: 'uuid',
+          pattern: REGISTRATION_REQUEST_ID.source,
+          description: 'Required only for first registration when agentSessionToken is absent. Generate and retain a random UUID v4; while the same Hub process is running, retrying the same registration returns the same capability.',
+        },
+      },
+      anyOf: [
+        { required: ['agentSessionToken'] },
+        { required: ['registrationRequestId'] },
+      ],
+    }
+  }
   return {
     ...schema,
-    properties: {
-      ...properties,
-      hubSessionId: {
-        type: 'string',
-        description: 'Optional session capability from the server instructions. Include this value in each tool call when the MCP transport does not preserve the Mcp-Session-Id HTTP header; do not share it with other connections.',
-      },
-    },
+    properties: { ...properties, agentSessionToken },
+    required: [...new Set([...originalRequired, 'agentSessionToken'])],
   }
 }
 
 /** Known MCP sessions and their peer bindings (shared with the hub tools). */
 export class SessionRegistry {
   readonly sessions = new Set<string>()
-  /** sessionId → peerId claimed via `bridge_register`. */
+  /** Logical business sessions; unlike MCP transport sessions, these are never read from HTTP headers. */
+  readonly agentSessionTokens = new Set<string>()
+  /** Idempotency key for first registration. The request id must be a random UUID v4. */
+  private readonly registrationRequests = new Map<string, { token: string; peerId: string; identityKey: string }>()
+  /** MCP transport session → logical agent sessions attached to that stream. */
+  private readonly agentsByTransport = new Map<string, Set<string>>()
+  /** Logical agent session → MCP transport sessions used only for SSE/liveness. */
+  private readonly transportsByAgent = new Map<string, Set<string>>()
+  /** Logical agent session token → peerId claimed via `bridge_register`. */
   readonly peerBindings = new Map<string, string>()
 
   /** Session id from the request header, if any. */
@@ -121,13 +145,97 @@ export class SessionRegistry {
     return id
   }
 
-  /** Has this session id ever been minted here and not terminated since?
-   *  A request presenting an id the registry does not know must be answered 404
-   *  (spec MUST) so the client starts a new session, instead of being adopted
-   *  silently — which is how a client kept talking to a hub that had restarted
-   *  and already forgotten it. */
+  /** Has this transport or logical session id been minted here and not terminated since? */
   hasSession(sessionId: string): boolean {
     return this.sessions.has(sessionId)
+  }
+
+  /** Whether a token was issued by bridge_register and remains active. */
+  isAgentSession(token: string): boolean {
+    return this.agentSessionTokens.has(token)
+  }
+
+  /** Issue (or idempotently recover) a logical session capability. */
+  createAgentSession(
+    registrationRequestId: string,
+    peerId: string,
+    identity?: TokenIdentity,
+  ): { token: string; created: boolean } {
+    const identityKey = identity === undefined ? '' : `${identity.peer}\u0000${identity.role}\u0000${identity.anonymous === true ? 'anonymous' : 'authenticated'}`
+    const existing = this.registrationRequests.get(registrationRequestId)
+    if (existing !== undefined) {
+      if (existing.peerId !== peerId || existing.identityKey !== identityKey) {
+        throw new Error('registrationRequestId was already used for a different identity; generate a new UUID')
+      }
+      if (!this.agentSessionTokens.has(existing.token)) {
+        this.registrationRequests.delete(registrationRequestId)
+        throw new Error('registration has expired; retry with a new registrationRequestId')
+      }
+      return { token: existing.token, created: false }
+    }
+    const token = randomUUID()
+    this.agentSessionTokens.add(token)
+    this.ensureSession(token)
+    this.registrationRequests.set(registrationRequestId, { token, peerId, identityKey })
+    if (identity !== undefined) this.bindToken(token, identity)
+    return { token, created: true }
+  }
+
+  /** Revoke a logical session and detach it from every transport stream. */
+  revokeAgentSession(token: string): void {
+    if (!this.agentSessionTokens.delete(token)) return
+    this.sessions.delete(token)
+    this.lastUsedAt.delete(token)
+    this.peerBindings.delete(token)
+    this.clientNames.delete(token)
+    this.clientVersions.delete(token)
+    this.sessionIps.delete(token)
+    this.tokenBindings.delete(token)
+    this.managerSessions.delete(token)
+    this.suppressedAuto.delete(token)
+    for (const [requestId, record] of this.registrationRequests) {
+      if (record.token === token) this.registrationRequests.delete(requestId)
+    }
+    for (const transportId of this.transportsByAgent.get(token) ?? []) {
+      const agents = this.agentsByTransport.get(transportId)
+      agents?.delete(token)
+      if (agents?.size === 0) this.agentsByTransport.delete(transportId)
+    }
+    this.transportsByAgent.delete(token)
+  }
+
+  /** Associate a logical session with the transport only for SSE/liveness. */
+  attachAgentSessionToTransport(transportId: string | undefined, token: string): void {
+    if (transportId === undefined || !this.sessions.has(transportId) || !this.agentSessionTokens.has(token)) return
+    const agents = this.agentsByTransport.get(transportId) ?? new Set<string>()
+    agents.add(token)
+    this.agentsByTransport.set(transportId, agents)
+    const transports = this.transportsByAgent.get(token) ?? new Set<string>()
+    transports.add(transportId)
+    this.transportsByAgent.set(token, transports)
+  }
+
+  /** Logical sessions associated with one MCP transport. */
+  agentSessionsForTransport(transportId: string): string[] {
+    return [...(this.agentsByTransport.get(transportId) ?? [])]
+  }
+
+  /** Transport streams that can deliver notifications to a peer. */
+  transportSessionsForPeer(peerId: string): string[] {
+    const transports = new Set<string>()
+    for (const [token, peer] of this.peerBindings) {
+      if (peer !== peerId) continue
+      for (const transportId of this.transportsByAgent.get(token) ?? []) transports.add(transportId)
+    }
+    return [...transports]
+  }
+
+  /** Whether a logical agent has an attached live SSE stream. */
+  isAgentSessionLive(token: string): boolean {
+    for (const transportId of this.transportsByAgent.get(token) ?? []) {
+      if (this.liveStreams.has(transportId)) return true
+    }
+    return this.liveStreams.has(token)
   }
 
   /** Peer bound to a session, if any. */
@@ -139,10 +247,12 @@ export class SessionRegistry {
   /** Bind `peerId` to `sessionId`; rejects when the session already claimed
    * a different peer or the session id is absent. */
   bindPeer(sessionId: string | undefined, peerId: string): string {
-    if (sessionId === undefined) throw new Error('no MCP session — re-initialize the connection')
+    if (sessionId === undefined || !this.agentSessionTokens.has(sessionId)) {
+      throw new Error('missing logical agent session — call bridge_register first')
+    }
     const existing = this.peerBindings.get(sessionId)
     if (existing !== undefined && existing !== peerId) {
-      throw new Error(`this connection is already registered as '${existing}'`)
+      throw new Error(`this logical session is already registered as '${existing}'`)
     }
     this.peerBindings.set(sessionId, peerId)
     this.sessions.add(sessionId)
@@ -177,21 +287,20 @@ export class SessionRegistry {
     return this.clientVersions.get(sessionId)
   }
 
-  /** Sessions whose owner explicitly unregistered; auto-registration is
-   * suppressed for them until an explicit `bridge_register`. */
+  /** Legacy explicit-unregister markers retained for compatibility; no implicit registration path reads them. */
   private readonly suppressedAuto = new Set<string>()
 
-  /** Suppress auto-registration for this session (on bridge_unregister). */
+  /** Record a legacy explicit-unregister marker. Business identity is already explicit. */
   suppressAuto(sessionId: string | undefined): void {
     if (sessionId !== undefined) this.suppressedAuto.add(sessionId)
   }
 
-  /** Allow auto-registration again (on explicit bridge_register). */
+  /** Clear the legacy marker when explicit registration succeeds. */
   clearSuppress(sessionId: string | undefined): void {
     if (sessionId !== undefined) this.suppressedAuto.delete(sessionId)
   }
 
-  /** Whether this session may not auto-register. */
+  /** Inspect the legacy marker; no implicit registration path consults it. */
   isSuppressed(sessionId: string | undefined): boolean {
     return sessionId !== undefined && this.suppressedAuto.has(sessionId)
   }
@@ -214,27 +323,38 @@ export class SessionRegistry {
    * Forget sessions that are finished: no live SSE stream, and unused for `ttlMs`.
    * Returns the ids removed. `ttlMs <= 0` disables reaping.
    *
-   * Safe because a client that gets 404 is REQUIRED by the spec to send a fresh
-   * `initialize`, and the hub auto-registers it under the same peer id — it comes
-   * back with its mailbox intact. A live SSE stream pins a session regardless of
-   * age: that is the one signal that means "still connected", and it wins.
+   * A client that gets 404 must send fresh `initialize`, then explicitly call
+   * `bridge_register` to acquire a logical capability. Transport reinitialization
+   * does not create a peer or revive a revoked token. A live SSE stream pins a
+   * transport session regardless of age: that is the one signal that means
+   * "still connected", and it wins.
    */
   sweep(now: number, ttlMs: number): string[] {
     if (ttlMs <= 0) return []
     const removed: string[] = []
     for (const sessionId of [...this.sessions]) {
-      if (this.liveStreams.has(sessionId)) continue
+      if (this.liveStreams.has(sessionId) || (this.agentSessionTokens.has(sessionId) && this.isAgentSessionLive(sessionId))) continue
       const last = this.lastUsedAt.get(sessionId) ?? now
       if (now - last <= ttlMs) continue
+      if (this.agentSessionTokens.has(sessionId)) {
+        this.revokeAgentSession(sessionId)
+        removed.push(sessionId)
+        continue
+      }
       this.sessions.delete(sessionId)
       this.lastUsedAt.delete(sessionId)
-      this.peerBindings.delete(sessionId)
       this.clientNames.delete(sessionId)
       this.clientVersions.delete(sessionId)
       this.sessionIps.delete(sessionId)
       this.tokenBindings.delete(sessionId)
       this.managerSessions.delete(sessionId)
       this.suppressedAuto.delete(sessionId)
+      for (const token of this.agentsByTransport.get(sessionId) ?? []) {
+        const transports = this.transportsByAgent.get(token)
+        transports?.delete(sessionId)
+        if (transports?.size === 0) this.transportsByAgent.delete(token)
+      }
+      this.agentsByTransport.delete(sessionId)
       removed.push(sessionId)
     }
     return removed
@@ -359,7 +479,7 @@ export class McpStreamableHttpServer {
     private readonly info: { name: string; version: string },
     private readonly registry: SessionRegistry,
     private readonly log: (message: string) => void = () => {},
-    /** Called right after a session initializes (eager auto-registration hook). */
+    /** Compatibility callback after transport initialization; it must not create a business peer. */
     private readonly onInitialize: (sessionId: string, clientName: string | undefined, clientVersion: string | undefined) => void = () => {},
     /** Remote auth (src/auth.ts): resolve the bearer token of a request to a
      * token identity; undefined = unauthorized. When absent (loopback mode)
@@ -574,6 +694,10 @@ export class McpStreamableHttpServer {
         this.unauthorized(req, res, null, 'token does not match this session')
         return
       }
+      if (bound === undefined && !streamIdentity.anonymous) {
+        this.unauthorized(req, res, null, 'MCP transport session is not bound to this bearer identity')
+        return
+      }
     }
     // Validation ORDER, both methods: auth → protocol version → session.
     // The order decides which status code wins when more than one check fails, so
@@ -701,8 +825,8 @@ export class McpStreamableHttpServer {
 
   private async handlePost(req: IncomingMessage, res: ServerResponse): Promise<void> {
     // Remote auth: every request (initialize included) must present a valid
-    // bearer token. Session ownership is checked after parsing the request so
-    // the same session can arrive in the standard header or tool arguments.
+    // bearer token. MCP transport ownership is checked independently from the
+    // logical agentSessionToken carried in tools/call arguments.
     let authIdentity: TokenIdentity | undefined
     if (this.authenticate !== undefined) {
       authIdentity = this.authenticate(req)
@@ -733,47 +857,55 @@ export class McpStreamableHttpServer {
     }
 
     const id = message.id ?? null
-    const headerSessionId = this.registry.sessionIdFor(req)
-    const rawArgumentSessionId = toolArgumentHubSessionId(message)
-    if (rawArgumentSessionId !== undefined && (typeof rawArgumentSessionId !== 'string' || rawArgumentSessionId.trim() === '')) {
-      this.jsonRpcError(req, res, id, -32602, 'hubSessionId must be a non-empty string')
-      return
-    }
-    const argumentSessionId = typeof rawArgumentSessionId === 'string' ? rawArgumentSessionId : undefined
-    if (headerSessionId !== undefined && argumentSessionId !== undefined && headerSessionId !== argumentSessionId) {
-      this.jsonRpcError(req, res, id, -32602, 'hubSessionId does not match Mcp-Session-Id header')
-      return
-    }
-    const sessionId = headerSessionId ?? argumentSessionId
-
-    if (authIdentity !== undefined) {
-      const bound = sessionId === undefined ? undefined : this.registry.tokenFor(sessionId)
-      // allow-join walk-ins present NO token on later requests: the sentinel
-      // identity ('__join__') must keep matching the session's already-minted
-      // unique anonymous peer. Only a real (non-anonymous) mismatch is fraud.
-      const bothAnonymous = bound?.anonymous === true && authIdentity.anonymous === true
-      if (bound !== undefined && !bothAnonymous && (bound.peer !== authIdentity.peer || bound.role !== authIdentity.role)) {
-        this.unauthorized(req, res, id, 'token does not match this session')
-        return
-      }
-      // A known session may still have no token binding yet (for example, one
-      // first minted by an SSE stream); never bind an unknown/stale session id.
-      if (sessionId !== undefined && this.registry.hasSession(sessionId) && bound === undefined && !authIdentity.anonymous) {
-        this.registry.bindToken(sessionId, authIdentity)
-      }
-    }
-
-    // A request presenting an unknown session id gets 404 so the client starts
-    // a new initialize cycle instead of carrying on under an id the hub forgot.
-    if (sessionId !== undefined && !this.registry.hasSession(sessionId)) {
+    // MCP's session header is transport-only. It is validated for the HTTP/SSE
+    // lifecycle, but never selects the peer or business session for a tool call.
+    const transportSessionId = this.registry.sessionIdFor(req)
+    if (transportSessionId !== undefined && !this.registry.hasSession(transportSessionId)) {
       this.jsonRpcError(req, res, id, -32001, 'session not found — send a new initialize request', undefined, 404)
       return
     }
-    this.registry.touch(sessionId)
-    if (sessionId !== undefined) this.registry.sessionIps.set(sessionId, clientIp(req))
-    // Loopback mode has no token table, so the manager secret is proven per request
-    // and remembered on the session (bridge_register runs after initialize).
-    if (sessionId !== undefined && this.presentedManagerToken(req)) this.registry.markManagerSession(sessionId)
+    this.registry.touch(transportSessionId)
+
+    // Keep the MCP transport session bound to the bearer identity that created
+    // it. This protects its SSE stream; it does not select the business peer.
+    if (transportSessionId !== undefined && authIdentity !== undefined) {
+      const transportIdentity = this.registry.tokenFor(transportSessionId)
+      const bothAnonymous = transportIdentity?.anonymous === true && authIdentity.anonymous === true
+      if (transportIdentity !== undefined && !bothAnonymous
+        && (transportIdentity.peer !== authIdentity.peer || transportIdentity.role !== authIdentity.role)) {
+        this.unauthorized(req, res, id, 'bearer token does not match MCP transport session')
+        return
+      }
+      if (transportIdentity === undefined && !authIdentity.anonymous) {
+        this.unauthorized(req, res, id, 'MCP transport session is not bound to this bearer identity')
+        return
+      }
+    }
+
+    // In remote-auth mode, the bearer identity must match the logical capability
+    // supplied in tool arguments. A shared MCP transport header cannot authorize
+    // access to another AI's logical session.
+    if (message.method === 'tools/call' && authIdentity !== undefined) {
+      const params = message.params
+      const args = typeof params === 'object' && params !== null && !Array.isArray(params)
+        ? (params as { arguments?: unknown }).arguments
+        : undefined
+      const token = typeof args === 'object' && args !== null && !Array.isArray(args)
+        ? (args as Record<string, unknown>).agentSessionToken
+        : undefined
+      if (typeof token === 'string' && this.registry.isAgentSession(token)) {
+        const bound = this.registry.tokenFor(token)
+        const bothAnonymous = bound?.anonymous === true && authIdentity.anonymous === true
+        if (bound !== undefined && !bothAnonymous && (bound.peer !== authIdentity.peer || bound.role !== authIdentity.role)) {
+          this.unauthorized(req, res, id, 'bearer token does not match agentSessionToken')
+          return
+        }
+        if (bound === undefined && !authIdentity.anonymous) {
+          this.unauthorized(req, res, id, 'agentSessionToken is not bound to this bearer identity')
+          return
+        }
+      }
+    }
 
     // Notifications carry no id: acknowledge and move on.
     if (id === null) {
@@ -782,7 +914,13 @@ export class McpStreamableHttpServer {
     }
 
     try {
-      const { result, extraHeaders } = await this.dispatch(message, sessionId, authIdentity)
+      const { result, extraHeaders } = await this.dispatch(
+        message,
+        transportSessionId,
+        authIdentity,
+        this.presentedManagerToken(req),
+        clientIp(req),
+      )
       res.writeHead(200, {
         ...this.corsFor(req),
         'Content-Type': 'application/json; charset=utf-8',
@@ -798,25 +936,22 @@ export class McpStreamableHttpServer {
 
   private async dispatch(
     message: JsonRpcRequest,
-    sessionId: string | undefined,
+    transportSessionId: string | undefined,
     authIdentity?: TokenIdentity,
+    managerTokenPresented = false,
+    requestIp = '',
   ): Promise<{ result: unknown; extraHeaders?: Record<string, string> }> {
     const method = message.method ?? ''
     switch (method) {
       case 'initialize': {
-        const newSessionId = this.registry.ensureSession(sessionId)
+        const newSessionId = this.registry.ensureSession(transportSessionId)
+        // The standard MCP session is only a transport/SSE capability. Bind it
+        // to the bearer that initialized it, but never use it as the business peer.
+        if (authIdentity !== undefined) this.registry.bindToken(newSessionId, authIdentity)
         const clientInfo = (message.params as { clientInfo?: { name?: unknown; version?: unknown } })?.clientInfo
         const clientName = typeof clientInfo?.name === 'string' && clientInfo.name !== '' ? clientInfo.name : undefined
         const clientVersion = typeof clientInfo?.version === 'string' && clientInfo.version !== '' ? clientInfo.version : undefined
-        if (clientName !== undefined) {
-          this.registry.noteClient(newSessionId, clientName, clientVersion)
-        }
-        // Remote auth: the token identity (not the client name) owns this
-        // session from now on; auto-registration resolves through it.
-        if (authIdentity !== undefined) {
-          this.registry.bindToken(newSessionId, authIdentity)
-        }
-        // Eager auto-registration: connecting the MCP is enough to join.
+        if (clientName !== undefined) this.registry.noteClient(newSessionId, clientName, clientVersion)
         this.onInitialize(newSessionId, clientName, clientVersion)
         const requested = (message.params as { protocolVersion?: unknown })?.protocolVersion
         const protocolVersion = typeof requested === 'string' && (SUPPORTED_VERSIONS as readonly string[]).includes(requested)
@@ -828,7 +963,7 @@ export class McpStreamableHttpServer {
             protocolVersion,
             capabilities: { tools: { listChanged: false } },
             serverInfo: { name: this.info.name, version: this.info.version },
-            instructions: `You are already registered with the hub (auto-registered at connect). Use bridge_chat / bridge_task / bridge_wait / bridge_poll / bridge_status / bridge_peers / bridge_history / bridge_ack to talk to other agents; bridge_register(peerId) renames your identity. This connection's hubSessionId is ${newSessionId}. If the MCP transport does not preserve the Mcp-Session-Id HTTP header, include hubSessionId="${newSessionId}" in every tool call's arguments. Treat this value as a private per-connection capability and never share it with other connections.`,
+            instructions: 'MCP transport initialized. To join the Hub, call bridge_register with your peerId and a fresh registrationRequestId UUID (unless your bearer identity supplies the peerId). The successful registration result contains agentSessionToken. Include that exact token in every subsequent tool call argument. The MCP session header is transport-only and never determines your business identity. Keep agentSessionToken private to this AI session.',
           },
         }
       }
@@ -836,7 +971,7 @@ export class McpStreamableHttpServer {
         return { result: { tools: this.tools.map(tool => ({
           name: tool.name,
           description: tool.description,
-          inputSchema: inputSchemaWithHubSessionId(tool.inputSchema),
+          inputSchema: inputSchemaWithAgentSessionToken(tool.inputSchema, tool.name),
         })) } }
       case 'tools/call': {
         const params = (message.params ?? {}) as { name?: unknown; arguments?: unknown }
@@ -847,12 +982,67 @@ export class McpStreamableHttpServer {
         if (typeof args !== 'object' || args === null || Array.isArray(args)) {
           throw rpcError(-32602, 'tools/call arguments must be an object')
         }
+
+        let logicalSessionId: string | undefined
+        let createdAgentSession = false
         try {
           const toolArgs = { ...args }
-          delete toolArgs.hubSessionId
-          const value = await tool.handler(toolArgs, sessionId)
-          return { result: { content: [{ type: 'text', text: JSON.stringify(value) }], isError: false } }
+          const suppliedToken = args.agentSessionToken
+
+          if (tool.name === 'bridge_register' && suppliedToken === undefined) {
+            const requestId = args.registrationRequestId
+            if (typeof requestId !== 'string' || !REGISTRATION_REQUEST_ID.test(requestId)) {
+              throw new Error('registrationRequestId must be a fresh random UUID when agentSessionToken is absent')
+            }
+            let peerId = typeof args.peerId === 'string' && args.peerId !== '' ? args.peerId : undefined
+            let logicalIdentity = authIdentity
+            if (authIdentity?.anonymous === true) {
+              // Derive a unique, retry-stable anonymous peer from the random
+              // registration id; never merge walk-ins behind one transport/NAT.
+              peerId = `join-${requestId.replace(/-/g, '').slice(0, 20)}`
+              toolArgs.peerId = peerId
+              logicalIdentity = { ...authIdentity, peer: peerId }
+            } else if (authIdentity !== undefined && peerId === undefined) {
+              peerId = authIdentity.peer
+              toolArgs.peerId = peerId
+            }
+            if (peerId === undefined) throw new Error('peerId is required for first registration when no bearer identity supplies it')
+            const issued = this.registry.createAgentSession(requestId, peerId, logicalIdentity)
+            logicalSessionId = issued.token
+            createdAgentSession = issued.created
+            this.registry.noteClient(
+              logicalSessionId,
+              this.registry.clientName(transportSessionId) ?? peerId,
+              this.registry.clientVersion(transportSessionId),
+            )
+          } else {
+            if (typeof suppliedToken !== 'string' || suppliedToken.trim() === '') {
+              throw new Error('agentSessionToken is required — call bridge_register with a registrationRequestId first')
+            }
+            if (!this.registry.isAgentSession(suppliedToken)) {
+              throw new Error('agentSessionToken is invalid or expired — register again with a new registrationRequestId')
+            }
+            logicalSessionId = suppliedToken
+          }
+
+          this.registry.touch(logicalSessionId)
+          if (requestIp !== '') this.registry.sessionIps.set(logicalSessionId, requestIp)
+          this.registry.attachAgentSessionToTransport(transportSessionId, logicalSessionId)
+          if (managerTokenPresented) this.registry.markManagerSession(logicalSessionId)
+
+          delete toolArgs.agentSessionToken
+          delete toolArgs.registrationRequestId
+          const value = await tool.handler(toolArgs, logicalSessionId)
+          let output = value
+          if (tool.name === 'bridge_register' && typeof value === 'object' && value !== null && !Array.isArray(value)) {
+            output = { ...(value as Record<string, unknown>), agentSessionToken: logicalSessionId }
+          }
+          if (tool.name === 'bridge_unregister' && args.peer === undefined) {
+            this.registry.revokeAgentSession(logicalSessionId)
+          }
+          return { result: { content: [{ type: 'text', text: JSON.stringify(output) }], isError: false } }
         } catch (error) {
+          if (createdAgentSession && logicalSessionId !== undefined) this.registry.revokeAgentSession(logicalSessionId)
           return {
             result: {
               content: [{ type: 'text', text: JSON.stringify({ error: (error as Error).message }) }],

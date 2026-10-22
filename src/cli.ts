@@ -197,8 +197,10 @@ Setup options:
   -h, --help               Show this help
   -V, --version            Show version
 
-Agents connect via MCP streamable-http at http://<host>:<port><path> and are
-auto-registered at connect (client name becomes the peer id).`)
+Agents connect via MCP streamable-http at http://<host>:<port><path>.
+initialize opens the transport only; call bridge_register to create a peer and
+include the returned agentSessionToken on every later tool call. Mcp-Session-Id
+is transport-only (HTTP/SSE).`)
 }
 
 const log = {

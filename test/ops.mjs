@@ -4,6 +4,7 @@
  * auto-start service command's per-platform dry-run output.
  */
 
+import { randomUUID } from 'node:crypto'
 import { startHub } from './entry.mjs'
 import { runStatus, runService } from './ops-entry.mjs'
 
@@ -33,7 +34,13 @@ try {
     return res.json()
   }
   await rpc('initialize', { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'fakepeer', version: '1' } })
-  await rpc('tools/call', { name: 'bridge_peers', arguments: {} })
+  const registration = await rpc('tools/call', {
+    name: 'bridge_register',
+    arguments: { peerId: 'fakepeer', registrationRequestId: randomUUID() },
+  })
+  const registrationText = registration.result?.content?.[0]?.text
+  const registered = JSON.parse(registrationText ?? '{}')
+  await rpc('tools/call', { name: 'bridge_peers', arguments: { agentSessionToken: registered.agentSessionToken } })
 
   const up = await runStatus({ host: '127.0.0.1', port: PORT })
   check('status reports running', up.running === true, JSON.stringify(up))

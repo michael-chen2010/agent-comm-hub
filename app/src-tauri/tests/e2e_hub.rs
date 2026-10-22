@@ -109,13 +109,16 @@ async fn e2e_gui_client_push_timeliness_against_real_hub() {
         // The GUI's own client: same clientInfo name as the app uses.
         let gui = McpClient::new(base.0, base.1, base.2, ClientInfo::new("agent-hub-cli", "test"), None);
         gui.initialize().await.expect("gui initialize");
-        gui.tools_call("bridge_register", json!({}))
+        gui.tools_call("bridge_register", json!({ "peerId": "agent-hub-cli" }))
             .await
             .expect("gui bridge_register");
         let mut rx = gui.subscribe_notifications().await.expect("gui subscribe");
 
         let bob = McpClient::new(base.0, base.1, base.2, ClientInfo::new("bob", "test"), None);
         bob.initialize().await.expect("bob initialize");
+        bob.tools_call("bridge_register", json!({ "peerId": "bob" }))
+            .await
+            .expect("bob bridge_register");
 
         // Core timeliness assertion: bob sends; the GUI's SSE receives the
         // message relay WITHOUT any bridge_wait/bridge_poll being issued.
@@ -182,6 +185,7 @@ async fn e2e_gui_client_bearer_token_against_auth_hub() {
             Some("rust-e2e-token-0123456789abcdef".to_string()),
         );
         authed.initialize().await.expect("authed initialize");
+        authed.tools_call("bridge_register", json!({})).await.expect("authed bridge_register");
         let peers = authed.tools_call("bridge_peers", json!({})).await.expect("bridge_peers");
         let text = peers.to_string();
         assert!(text.contains("gui-remote"), "token-bound peer missing: {text}");
@@ -221,6 +225,9 @@ async fn e2e_client_connects_with_full_url_host() {
         );
         assert_eq!(gui.endpoint_url(), "http://127.0.0.1:19033/mcp");
         gui.initialize().await.expect("initialize through a full-URL host");
+        gui.tools_call("bridge_register", json!({ "peerId": "agent-hub-cli" }))
+            .await
+            .expect("bridge_register through a full-URL host");
         // A follow-up tools/call proves the same URL serves the request-response path too. The
         // returned value is the raw MCP envelope (content[0].text), so match on its serialized form.
         let peers = gui.tools_call("bridge_peers", json!({})).await.expect("bridge_peers");

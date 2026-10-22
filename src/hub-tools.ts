@@ -9,7 +9,6 @@ import type { AgentHub } from './hub.js'
 import type { McpTool, SessionRegistry } from './mcp-server.js'
 import { AGENT_STATUSES, type HerdrCtl } from './herdr-ctl.js'
 import { CLIENT_ACK_STATUSES, a2aState, decodeContent, encodeContent, type AckContent, type AckStatus, type BridgeMessage, BROADCAST, HUB_PEER, type NoticeContent, type NoticeLevel, PEER_ID_PATTERN, type PeerCard, type TaskArtifact, type TaskContent, type TaskStatus, type WaitResult } from './protocol.js'
-import { ANON_JOIN_PEER } from './auth.js'
 
 /** Default wait budget when a client omits timeoutMs. */
 export const DEFAULT_WAIT_MS = 30_000
@@ -63,48 +62,28 @@ export function sanitizeAlias(alias: string): string {
 }
 
 /**
- * Auto-register a session. In remote auth mode the session's TOKEN decides
- * the peer id (each token maps to one identity — two people running the same
- * client stay two peers instead of sharing a mailbox); loopback mode keeps
- * deriving the id from the client-reported name. Same-id connections ATTACH
- * to the same peer (N:1, one stable identity per agent). No-op when the
- * session is already bound or explicitly unregistered. Returns the peer id.
+ * Compatibility export for older integrations: resolve an existing logical peer
+ * binding without creating one. MCP initialize is transport setup only; a client
+ * must explicitly call bridge_register and retain the returned agentSessionToken.
  */
 export function autoRegisterPeer(
-  hub: AgentHub,
+  _hub: AgentHub,
   registry: SessionRegistry,
   sessionId: string | undefined,
-  clientName: string | undefined,
-  clientVersion?: string,
+  _clientName: string | undefined,
+  _clientVersion?: string,
 ): string | undefined {
-  if (sessionId === undefined) return undefined
-  const bound = registry.peerFor(sessionId)
-  if (bound !== undefined) return bound
-  if (registry.isSuppressed(sessionId)) return undefined
-  const tokenPeer = registry.tokenFor(sessionId)?.peer
-  // Sentinel = anonymous walk-in whose initialize-resolution never ran (e.g.
-  // it started from an SSE stream): give it a session-unique fallback id so
-  // it can never merge with another walk-in.
-  const peerId = tokenPeer === ANON_JOIN_PEER
-    ? `join-${sanitizePeerId(clientName ?? 'agent')}-${Math.random().toString(36).slice(2, 6)}`
-    : (tokenPeer ?? sanitizePeerId(clientName ?? 'agent'))
-  if (!hub.has(peerId)) {
-    hub.register(peerId, {
-      ...(clientName !== undefined ? { name: clientName } : {}),
-      ...(clientVersion !== undefined ? { version: clientVersion } : {}),
-    })
-  }
-  registry.bindPeer(sessionId, peerId)
-  hub.touch(peerId)
-  return peerId
+  // Kept as a compatibility export, but MCP initialize is transport setup only:
+  // no transport session or client name can implicitly acquire a business identity.
+  if (sessionId === undefined || !registry.isAgentSession(sessionId)) return undefined
+  return registry.peerFor(sessionId)
 }
 
 /** Peers whose session has a live SSE stream (count as connected, GC-safe). */
 export function livePeersFor(registry: SessionRegistry): Set<string> {
   const live = new Set<string>()
-  const streams = registry.liveSessions()
   for (const [sessionId, peerId] of registry.peerBindings) {
-    if (streams.has(sessionId)) live.add(peerId)
+    if (registry.isAgentSessionLive(sessionId)) live.add(peerId)
   }
   return live
 }
@@ -315,24 +294,14 @@ export function hubTools(hub: AgentHub, registry: SessionRegistry, options: HubT
     return card
   }
 
-  /**
-   * Resolve the calling peer. Unregistered sessions auto-register using the
-   * client-reported name (from the MCP initialize clientInfo) unless the
-   * session explicitly unregistered — connecting the MCP is enough to join.
-   */
-
+  /** Resolve the caller only from an explicitly registered logical session. */
   const requirePeer = (sessionId: string | undefined): string => {
     const bound = registry.peerFor(sessionId)
     if (bound !== undefined) {
       hub.touch(bound)
       return bound
     }
-    const auto = autoRegisterPeer(hub, registry, sessionId, registry.clientName(sessionId))
-    if (auto !== undefined) {
-      hub.touch(auto)
-      return auto
-    }
-    throw new Error('not registered — call bridge_register(peerId) first')
+    throw new Error('not registered — call bridge_register with a registrationRequestId first')
   }
 
   const receipt = (message: BridgeMessage): unknown => ({
@@ -427,23 +396,17 @@ export function hubTools(hub: AgentHub, registry: SessionRegistry, options: HubT
   return [
     {
       name: 'bridge_register',
-      description: 'Claim or rename your identity on the hub. Sessions auto-share a peer id derived from the client name; call this to switch to a readable unique peerId such as "mavis" or "opencode:myproject". Optionally set your display alias (shown to other agents and the desktop roster; message routing keeps using the immutable peerId). Rejects when the id is claimed by another connection. Returns the current peer list.',
+      description: 'Create an independent logical Hub session or rename the identity bound to the supplied agentSessionToken. On first registration, pass a random UUID v4 registrationRequestId and a peerId (unless a bearer identity supplies the peerId). The successful result returns a private agentSessionToken; every subsequent tool call must include that exact token. MCP transport session headers never determine business identity. Optionally set a display alias. Rejects duplicate peer ids and reused registrationRequestIds with different identity data.',
       inputSchema: schema({
-        peerId: str('Unique peer id: letters/digits/._:- , 1-64 chars.'),
+        peerId: optStr('Peer id for first registration: letters/digits/._:-, 1-64 chars. Required for local unauthenticated clients; bearer-authenticated clients may omit it to use their bound identity.'),
         alias: optStr('Optional display name (1-64 chars, spaces/CJK allowed). Routing still uses peerId.'),
-      }, ['peerId']),
+      }),
       handler: async (args: Record<string, unknown>, sessionId: string | undefined) => {
-        // A missing peerId means "keep the id I already have" — the natural
-        // reading of an optional argument. `String(args.peerId)` used to turn it
-        // into the literal peer id "undefined", and because the id differed from
-        // the session's current one the re-key path believed it was a rename:
-        // the peer was atomically moved to "undefined" and every future message to
-        // the real id became "unknown recipient". app/src-tauri's own e2e test
-        // calls bridge_register with no peerId, which is why that suite was red.
         const boundId = registry.peerFor(sessionId)
-        const peerId = args.peerId === undefined ? boundId : String(args.peerId)
+        const tokenPeer = registry.tokenFor(sessionId)?.peer
+        const peerId = args.peerId === undefined ? (boundId ?? tokenPeer) : String(args.peerId)
         if (peerId === undefined) {
-          throw new Error('no peer to register — pass peerId (e.g. {"peerId":"mavis"}); this session is not bound to a peer yet')
+          throw new Error('peerId is required for first registration unless the bearer identity supplies it')
         }
         if (!PEER_ID_PATTERN.test(peerId)) {
           throw new Error(`invalid peerId: ${peerId} (expected [A-Za-z0-9._:-]{1,64})`)
@@ -459,7 +422,6 @@ export function hubTools(hub: AgentHub, registry: SessionRegistry, options: HubT
           throw new Error(`reserved peer id: ${peerId} (the hub uses it for its own notices)`)
         }
         const alias = args.alias === undefined ? undefined : sanitizeAlias(String(args.alias))
-        const tokenPeer = registry.tokenFor(sessionId)?.peer
         if (tokenPeer !== undefined && peerId !== tokenPeer) {
           // Remote auth: the token owns this session's identity — a self
           // id-change would break the operator's token→peer mapping. Ask a
@@ -491,7 +453,14 @@ export function hubTools(hub: AgentHub, registry: SessionRegistry, options: HubT
         // hub.profiles (persisted when a stateFile is configured) and receiving
         // mail into a mailbox nobody would ever drain — a ghost peer.
         registry.bindPeer(sessionId, peerId)
-        if (!hub.has(peerId)) hub.register(peerId)
+        if (!hub.has(peerId)) {
+          const clientName = registry.clientName(sessionId)
+          const clientVersion = registry.clientVersion(sessionId)
+          hub.register(peerId, {
+            ...(clientName !== undefined ? { name: clientName } : {}),
+            ...(clientVersion !== undefined ? { version: clientVersion } : {}),
+          })
+        }
         registry.clearSuppress(sessionId)
         hub.touch(peerId)
         if (alias !== undefined) hub.setAlias(peerId, alias)
@@ -501,7 +470,7 @@ export function hubTools(hub: AgentHub, registry: SessionRegistry, options: HubT
     },
     {
       name: 'bridge_unregister',
-      description: 'Leave the hub: detaches your session (and drops the peer when no other session shares it); auto-registration stays off until an explicit bridge_register. With `peer`, a hub MANAGER can kick another peer: its queue is dropped and every session attached to it is detached and kept from auto-re-registering. Idempotent.',
+      description: 'Revoke your logical agentSessionToken and detach your identity from the hub. With `peer`, a hub MANAGER can kick another peer: its queue is dropped and every logical session attached to it is detached and its capability revoked. Idempotent.',
       inputSchema: schema({
         peer: optStr('Kick this peer instead of yourself. Requires manager rights (hub managerPeers).'),
       }),
@@ -515,9 +484,9 @@ export function hubTools(hub: AgentHub, registry: SessionRegistry, options: HubT
           registry.suppressAuto(sessionId)
           return { ok: true, peerId: peer ?? null }
         }
-        // Manager kick: drop the target peer, detach ALL its sessions and
-        // suppress their auto-registration, so the kick survives the target's
-        // next tool call (it must explicitly bridge_register to come back).
+        // Manager kick: drop the target peer, detach ALL its logical sessions,
+        // and revoke their capabilities. A kicked client must explicitly register
+        // again with a fresh registrationRequestId before making business calls.
         const caller = registry.peerFor(sessionId)
         if (caller === undefined) throw new Error('not registered — call bridge_register(peerId) first')
         const target = String(args.peer)
@@ -530,6 +499,7 @@ export function hubTools(hub: AgentHub, registry: SessionRegistry, options: HubT
         }
         hub.unregister(target)
         const detached = registry.unbindPeerId(target, { suppress: true })
+        for (const token of detached) registry.revokeAgentSession(token)
         return { ok: true, peerId: target, kicked: true, detachedSessions: detached.length }
       },
     },

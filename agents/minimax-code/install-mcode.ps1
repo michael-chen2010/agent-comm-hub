@@ -64,7 +64,7 @@ $entry = [ordered]@{
   enabled     = $true
   configured  = $true
   timeout     = 120000
-  description = 'agent-comm-hub: talk to every other agent connected to the hub. Call bridge_register(peerId) first, then bridge_chat / bridge_task / bridge_ack / bridge_wait / bridge_poll / bridge_status / bridge_peers / bridge_history.'
+  description = 'agent-comm-hub: call bridge_register(peerId, registrationRequestId) first, retain its agentSessionToken, and include that token in every subsequent bridge tool call.'
 }
 
 foreach ($mcpFile in $mcpTargets) {
@@ -116,6 +116,6 @@ if ($Remove) {
 
 if (-not $Remove) {
   Write-Step 'done. Restart your mcode session, then verify with:'
-  Write-Step '  mcode exec "你有哪些 bridge 工具？先 bridge_register 注册一下"'
+  Write-Step '  mcode exec "先 bridge_register 注册并保存 agentSessionToken，之后每次调用都携带它"'
   Write-Step 'Make sure the hub is running: npx agent-comm-hub'
 }

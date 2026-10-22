@@ -21,14 +21,17 @@ Key facts:
   constraint — see [Invariants](#invariants).
 - **One process**: `npx agent-comm-hub` starts the hub; it is a foreground
   process that stops on Ctrl+C (auto-start via `service install` is optional).
-- **Connect = join**: the MCP handshake (`initialize`) auto-registers the
-  session using the `clientInfo` name — no manual registration step.
+- **Initialize = transport setup, not join**: the MCP handshake creates only the
+  HTTP/SSE transport session. A client must call `bridge_register` to create its
+  logical peer, retain the returned `agentSessionToken`, and pass that token on
+  every subsequent bridge tool call.
 - **Identity is server-injected**: `from` on every message comes from the
-  session→peer binding, never from the caller; peers cannot impersonate each
-  other. Same-name connections share one peer id (N:1) and one mailbox.
+  registered logical-session capability, never from the caller; peers cannot
+  impersonate each other. Same-name connections do not share a peer or mailbox;
+  each logical session must register a unique `peerId`.
 - **Offline-tolerant**: messages queue per peer (max 200, oldest dropped) and
   are delivered on the next `bridge_wait`/`bridge_poll`.
-- Version `0.10.0`, Node ≥ 22, MIT license, npm name `agent-comm-hub`, package
+- Version `0.10.1`, Node ≥ 22, MIT license, npm name `agent-comm-hub`, package
   manager is **pnpm** (single-package repo; `pnpm-workspace.yaml` only carries
   the pnpm 10 `allowBuilds` approval for esbuild). The one exception is the
   `admin/` web-console workspace, which uses **npm** (its own
@@ -44,7 +47,7 @@ layers:
 | Layer | Mechanism |
 |---|---|
 | Transport | MCP streamable-http hand-rolled over `node:http`; JSON-RPC + SSE; `Mcp-Session-Id` per connection; `charset=utf-8` on every response; **`Origin` gate** (no Origin / loopback / `--allow-origins` / same-host **with a bearer token**; anything else 403) and CORS that echoes an allowed origin instead of `*`; 1 MB request-body cap |
-| Identity | Auto-registration at `initialize`; `clientInfo.name` → peer id (sanitized, `agent` fallback); `bridge_register` renames; `bridge_unregister` detaches and suppresses re-auto-registration |
+| Identity | Explicit `bridge_register`; `clientInfo.name` is metadata only; each business tool call resolves identity from required `agentSessionToken`; `bridge_unregister` revokes the capability |
 | Routing | Per-peer FIFO mailbox + long-poll waiters; `bridge_wait` (default 30 s, server ceiling 60 s); sender-filtered waits; `ref`-filtered ack waits; `to: "all"` broadcast; ack routed back to the original sender of `ref` |
 | Protocol | Message `{id, seq, from, to, kind, content, ref?, channel?, threadId?, hop?, priority?, expiresAt?, ts}`; `priority` (0\|1\|2, absent = 0) orders the recipient's mailbox and decides what overflow drops (the LEAST important message, oldest first within a priority — unchanged from "oldest dropped" when nobody sets one); `kind` = `chat` \| `task` \| `notice` \| `ack`; the SSE push contract (`SSE_METHOD` / `SSE_EVENT_PEERS_CHANGED` / `SSE_EVENT_MESSAGE`) lives in `src/protocol.ts` and the desktop's Rust side mirrors the same named constants; task/ack/notice payloads are JSON-encoded strings decoded by `decodeContent`; every message carries a monotonic `seq` (never restarts — see `bridge_history { since }`) and may carry an absolute `expiresAt` (dropped and counted as `droppedExpired` instead of delivered late); `bridge_task` records a task ledger (status + ack timeline) with per-assignee delivery times; `ref` chains carry a `hop` depth that persists with the message (a restart cannot reset a chain) and is **counted, not enforced** — two ceilings, `MAX_HOP` (5) for a task re-delegation and `MAX_REPLY_CHAIN` (50) for a plain reply, past which `hop` simply stops counting; the message and its `ref` are always delivered |
 | Delivery | Per-peer mailbox with `maxQueue`; overflow is **counted** (`droppedOverflow`) rather than silent, and a waiting peer gets a `notice` from the reserved id `hub`. An optional per-peer token bucket (`ratePerMin`, 0 = off) limits how fast a mailbox ACCUMULATES — it guards the recipient against a broadcast storm and counts excess as `droppedRate` (no notice is queued for a rate drop, or the notices would fill the mailbox just as fast). Manual-ack leases (`ack: "manual"` + `bridge_commit`/`bridge_nack`, `leaseTtlMs`, `maxAttempts`) give at-least-once handling; `attempts`/`inFlight`/`deadLettered`/`droppedOverflow`/`droppedExpired`/`droppedRate` are visible in the roster |
@@ -57,7 +60,7 @@ src/
 ├── protocol.ts     # message kinds, BridgeMessage, task/ack payloads, peer id pattern
 ├── hub.ts          # AgentHub: registry, mailboxes, waiters, history ring, task ledger, idle GC (transport-agnostic)
 ├── mcp-server.ts   # SessionRegistry (sessions + peer bindings) + McpStreamableHttpServer
-├── hub-tools.ts    # the 39 bridge tools, auto-registration, peerId/alias sanitizing, profiles, result presentation
+├── hub-tools.ts    # the 39 bridge tools, explicit registration/token enforcement, peerId/alias sanitizing, profiles, result presentation
 ├── auth.ts         # remote-mode bearer-token table (load/validate/lookup)
 ├── persist.ts      # SQLite state store (node:sqlite): history ring, offline
 │                   #   mailboxes, profiles, groups, task ledger (remote mode)
@@ -146,8 +149,8 @@ pnpm install          # install dev deps (typescript, esbuild, @types/node only)
 pnpm typecheck        # tsc --noEmit (strict, ES2023, no emit)
 pnpm test             # build + build:test (esbuild), then node test/smoke.mjs
                       #   + test/setup.mjs + test/ops.mjs + test/herdr.mjs
-                      #   + test/discover.mjs + test/e2e.mjs → 319 checks
-                      #   (174+46+11+35+33+20)
+                      #   + test/discover.mjs + test/e2e.mjs → 321 checks
+                      #   (176+46+11+35+33+20)
 npm run build:admin   # admin/ (npm, not pnpm) → the single-file assets/admin.html
 pnpm run build        # esbuild → lib/{cli,index,setup}.js (zero-dependency bundle)
 pnpm pack             # build + npm pack (publishing artifact)
@@ -164,20 +167,20 @@ pnpm pack             # build + npm pack (publishing artifact)
   an **ubuntu / windows / macos matrix**, `pnpm install --frozen-lockfile` →
   `typecheck` → `test` → `pack` → upload the tarball as an artifact.
 - After any edit, run at least `pnpm typecheck` and the affected suite; before
-  merging, the full `pnpm test` must stay green (verified: 174/174 + 46/46 +
+  merging, the full `pnpm test` must stay green (verified: 176/176 + 46/46 +
   11/11 + 35/35 + 33/33 + 20/20 on Node 24 / Windows).
 
 ## Testing
 
-- `test/smoke.mjs` (174 checks): three simulated agents over real MCP sessions
+- `test/smoke.mjs` (176 checks): three simulated agents over real MCP sessions
   against a live `startHub()` — registration, duplicate rejection, rename,
   chat routing, sender-filtered waits, task+ack routing back to the original
   sender, task delivery bookkeeping (`deliveredMs` for both the waiter handoff
   and the mailbox path), broadcast (no echo to sender, recorded exactly once in history),
   status/peers/history incl. the
   `peer: "all"` unfiltered archiver view, unregister /
-  re-register, auto-registration (first tool call, eager at connect,
-  same-name sharing, unregister suppresses), SSE liveness, idle GC,
+  re-register, registrationRequestId/token lifecycle, independent same-name
+  logical sessions, unregister revocation, SSE liveness, idle GC,
   profiles/aliases/manager ops (roster metadata, manager rename + kick,
   non-manager denial, alias persistence/routing), SSE event push
   (peers_changed on join/alias edit, recipient-scoped mail hint), true
@@ -258,7 +261,7 @@ pnpm pack             # build + npm pack (publishing artifact)
    dependencies stay limited to what is needed to build/typecheck
    (`typescript`, `esbuild`, `@types/node`).
 2. **`from` is never caller-supplied.** Message sender identity must always
-   resolve from the session→peer binding (`requirePeer` / `autoRegisterPeer`).
+   resolve from the registered logical-session binding (`requirePeer` / `SessionRegistry.peerFor`), never caller-supplied parameters.
 3. **Lossless JSON everywhere.** Every tool result goes through
    `present()`/`receipt()`: drop `undefined` fields, keep numbers finite —
    DSH's strict tool registry rejects lossy values.

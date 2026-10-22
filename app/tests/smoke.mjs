@@ -3,6 +3,7 @@
 // 跑法：node scripts/smoke-mcp.mjs
 
 import { spawn } from 'node:child_process'
+import { randomUUID } from 'node:crypto'
 import { setTimeout as wait } from 'node:timers/promises'
 import { resolve } from 'node:path'
 import { existsSync } from 'node:fs'
@@ -34,20 +35,47 @@ const cleanup = () => {
 process.on('SIGINT', cleanup)
 process.on('SIGTERM', cleanup)
 
+let agentSessionToken
 async function postRpc(method, params, id, sessionId) {
+  let outgoingParams = params
+  if (method === 'tools/call' && params?.name) {
+    const args = { ...(params.arguments ?? {}) }
+    if (params.name === 'bridge_register') {
+      if (args.agentSessionToken === undefined && args.registrationRequestId === undefined) {
+        if (agentSessionToken !== undefined) args.agentSessionToken = agentSessionToken
+        else args.registrationRequestId = randomUUID()
+      }
+    } else {
+      if (agentSessionToken === undefined) throw new Error(`${params.name} requires bridge_register first`)
+      args.agentSessionToken = agentSessionToken
+    }
+    outgoingParams = { ...params, arguments: args }
+  }
   const headers = { 'Content-Type': 'application/json', Accept: 'application/json, text/event-stream' }
   if (sessionId) headers['Mcp-Session-Id'] = sessionId
   const resp = await fetch(HUB_URL, {
     method: 'POST',
     headers,
-    body: JSON.stringify({ jsonrpc: '2.0', id, method, params: params ?? null })
+    body: JSON.stringify({ jsonrpc: '2.0', id, method, params: outgoingParams ?? null })
   })
   const sid = resp.headers.get('mcp-session-id') ?? sessionId ?? null
   const text = await resp.text()
   if (!resp.ok) throw new Error(`HTTP ${resp.status}: ${text}`)
   const json = JSON.parse(text)
   if (json.error) throw new Error(`JSON-RPC error: ${JSON.stringify(json.error)}`)
-  return { result: json.result ?? null, sessionId: sid }
+  const result = json.result ?? null
+  if (method === 'tools/call' && params?.name === 'bridge_register') {
+    const resultText = result?.content?.[0]?.text
+    const decoded = JSON.parse(resultText ?? '{}')
+    if (result?.isError === true && typeof decoded.error === 'string' && /invalid or expired/.test(decoded.error)) {
+      agentSessionToken = undefined
+    } else if (result?.isError !== true && typeof decoded.agentSessionToken === 'string') {
+      agentSessionToken = decoded.agentSessionToken
+    }
+  } else if (method === 'tools/call' && params?.name === 'bridge_unregister' && params.arguments?.peer === undefined && result?.isError !== true) {
+    agentSessionToken = undefined
+  }
+  return { result, sessionId: sid }
 }
 
 async function waitForHub(maxMs = 10_000) {
@@ -67,7 +95,7 @@ async function main() {
   await waitForHub()
   console.log('✓ hub 端口就绪')
 
-  // 1. initialize（clientInfo.name 触发 hub 端 auto-register）
+  // 1. initialize 只建立 MCP transport session；业务身份必须显式 bridge_register。
   const { result: init, sessionId } = await postRpc(
     'initialize',
     {
@@ -92,8 +120,16 @@ async function main() {
     return JSON.parse(txt)
   }
 
-  // 2. bridge_peers（应至少包含 smoke-test 自己）
-  const { result: peersRaw } = await postRpc('tools/call', { name: 'bridge_peers', arguments: {} }, 2, sessionId)
+  // 2. bridge_register 明确创建业务身份，并从响应中保存 agentSessionToken。
+  const { result: registerRaw } = await postRpc('tools/call', { name: 'bridge_register', arguments: { peerId: 'smoke-test' } }, 2, sessionId)
+  const initialRegistration = unwrapBridge(registerRaw)
+  if (!initialRegistration.ok || typeof initialRegistration.agentSessionToken !== 'string') {
+    throw new Error(`bridge_register 初次注册失败: ${JSON.stringify(initialRegistration)}`)
+  }
+  console.log('✓ bridge_register initial identity:', initialRegistration.peerId)
+
+  // 3. bridge_peers（应至少包含 smoke-test 自己）
+  const { result: peersRaw } = await postRpc('tools/call', { name: 'bridge_peers', arguments: {} }, 3, sessionId)
   const peers = unwrapBridge(peersRaw)
   console.log('✓ bridge_peers:', JSON.stringify(peers).slice(0, 200))
   if (!peers.peers || !Array.isArray(peers.peers)) throw new Error('bridge_peers 返回结构错误')
@@ -101,11 +137,11 @@ async function main() {
   if (!ids.includes('smoke-test')) throw new Error(`bridge_peers 不包含 smoke-test: ${JSON.stringify(ids)}`)
   console.log(`  online peers: ${peers.peers.filter((p) => p.connected).length}/${peers.peers.length}`)
 
-  // 3. bridge_register 改名（验证工具调用完整链路）
+  // 4. bridge_register 改名（验证后续调用自动携带 agentSessionToken）
   const { result: regRaw } = await postRpc(
     'tools/call',
     { name: 'bridge_register', arguments: { peerId: 'smoke-test-renamed' } },
-    3,
+    4,
     sessionId
   )
   const reg = unwrapBridge(regRaw)
@@ -114,8 +150,8 @@ async function main() {
     throw new Error(`bridge_register 返回不符预期: ${JSON.stringify(reg)}`)
   }
 
-  // 4. bridge_peers 验证改名生效
-  const { result: peers2Raw } = await postRpc('tools/call', { name: 'bridge_peers', arguments: {} }, 4, sessionId)
+  // 5. bridge_peers 验证改名生效
+  const { result: peers2Raw } = await postRpc('tools/call', { name: 'bridge_peers', arguments: {} }, 5, sessionId)
   const peers2 = unwrapBridge(peers2Raw)
   const ids2 = peers2.peers.map((p) => p.id)
   if (!ids2.includes('smoke-test-renamed')) throw new Error(`改名后 peer list 不含 smoke-test-renamed: ${JSON.stringify(ids2)}`)
