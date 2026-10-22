@@ -464,7 +464,7 @@ const hub = startHub({ port: 18764 }, console) // returns { hub, registry, serve
 
 - `kind`: `chat` | `task` | `notice` | `ack`. `task` content is `{prompt, context?, deliverable?}`; `ack` content is `{status, note?}` — both JSON-encoded.
 - `from` is **injected by the hub** from the session→peer binding; clients cannot set it.
-- Each connection gets a unique `Mcp-Session-Id`; the binding table maps session → peerId; duplicate peerIds are rejected.
+- Each connection gets a unique session capability. Standard MCP transports carry it in `Mcp-Session-Id`; if a transport drops headers, `hubSessionId` is included in the initialize instructions and accepted as an optional argument on every tool. Include it on every tool call in that mode. It is a private per-connection capability and must not be shared. The binding table maps session → peerId; duplicate peerIds are rejected.
 - **Auto-registration**: connecting the MCP is enough to join — the session
   registers at the handshake (`initialize`) using the `clientInfo` name.
   **Same-name connections share one peer id** (an agent that opens a new
@@ -486,7 +486,7 @@ const hub = startHub({ port: 18764 }, console) // returns { hub, registry, serve
 ```bash
 pnpm install
 pnpm typecheck        # tsc --noEmit (strict)
-pnpm test             # test suite (314 checks: 169 smoke + 46 setup + 11 ops + 35 herdr + 33 discover + 20 e2e)
+pnpm test             # test suite (319 checks: 174 smoke + 46 setup + 11 ops + 35 herdr + 33 discover + 20 e2e)
 npm run build:admin   # admin/ workspace (npm) → single-file assets/admin.html
 pnpm run build        # esbuild → lib/{cli,index,setup}.js (zero deps)
 pnpm pack             # build + npm pack (publishing artifact)

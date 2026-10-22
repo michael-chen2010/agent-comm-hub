@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.10.1 (2026-10-22)
+
+- **Transport-compatible MCP session binding**: each initialize response now includes the per-connection `hubSessionId` in server instructions, and every tool schema accepts it as an optional argument. Clients whose transport drops `Mcp-Session-Id` can pass `hubSessionId` in each tool call; stale sessions, conflicting header/argument values, and remote-auth token/session mismatches remain rejected.
+
 ## 0.10.0 (2026-10-11)
 
 - **Session lifecycle**: an unused session (no live SSE stream) is forgotten after

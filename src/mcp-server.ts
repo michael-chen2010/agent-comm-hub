@@ -76,6 +76,32 @@ interface JsonRpcRequest {
   params?: unknown
 }
 
+function toolArgumentHubSessionId(message: JsonRpcRequest): unknown {
+  if (message.method !== 'tools/call') return undefined
+  const params = message.params
+  if (typeof params !== 'object' || params === null || Array.isArray(params)) return undefined
+  const args = (params as { arguments?: unknown }).arguments
+  if (typeof args !== 'object' || args === null || Array.isArray(args)) return undefined
+  return (args as Record<string, unknown>).hubSessionId
+}
+
+function inputSchemaWithHubSessionId(schema: Record<string, unknown>): Record<string, unknown> {
+  const value = schema.properties
+  const properties = typeof value === 'object' && value !== null && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : {}
+  return {
+    ...schema,
+    properties: {
+      ...properties,
+      hubSessionId: {
+        type: 'string',
+        description: 'Optional session capability from the server instructions. Include this value in each tool call when the MCP transport does not preserve the Mcp-Session-Id HTTP header; do not share it with other connections.',
+      },
+    },
+  }
+}
+
 /** Known MCP sessions and their peer bindings (shared with the hub tools). */
 export class SessionRegistry {
   readonly sessions = new Set<string>()
@@ -675,7 +701,8 @@ export class McpStreamableHttpServer {
 
   private async handlePost(req: IncomingMessage, res: ServerResponse): Promise<void> {
     // Remote auth: every request (initialize included) must present a valid
-    // bearer token; an established session must keep presenting ITS token.
+    // bearer token. Session ownership is checked after parsing the request so
+    // the same session can arrive in the standard header or tool arguments.
     let authIdentity: TokenIdentity | undefined
     if (this.authenticate !== undefined) {
       authIdentity = this.authenticate(req)
@@ -683,36 +710,9 @@ export class McpStreamableHttpServer {
         this.unauthorized(req, res, null, 'missing or invalid bearer token')
         return
       }
-      const existingSession = this.registry.sessionIdFor(req)
-      const bound = existingSession === undefined ? undefined : this.registry.tokenFor(existingSession)
-      // allow-join walk-ins present NO token on later requests: the sentinel
-      // identity ('__join__') must keep matching the session's already-minted
-      // unique anonymous peer. Only a real (non-anonymous) mismatch is fraud.
-      const bothAnonymous = bound?.anonymous === true && authIdentity.anonymous === true
-      if (bound !== undefined && !bothAnonymous && (bound.peer !== authIdentity.peer || bound.role !== authIdentity.role)) {
-        this.unauthorized(req, res, null, 'token does not match this session')
-        return
-      }
-      // A KNOWN session may still have no token binding yet (a session minted
-      // by an earlier stream, say): re-bind it here so a request never degrades
-      // to a nameless 'agent' peer.
-      if (existingSession !== undefined && bound === undefined && !authIdentity.anonymous) {
-        this.registry.bindToken(existingSession, authIdentity)
-      }
     }
-    // Spec MUST: a request presenting a session id the hub does not know is
-    // answered 404, so the client starts a new session instead of carrying on
-    // under an id that maps to nothing. A hub restart creates exactly this for
-    // every connected client — which used to be papered over by adopting the id
-    // (see the remote-auth re-bind above), leaving clients permanently adrift.
+    // Validation order remains auth → protocol version → session.
     if (this.protocolVersionRejected(req, res)) return
-    const presentedSession = this.registry.sessionIdFor(req)
-    if (presentedSession !== undefined && !this.registry.hasSession(presentedSession)) {
-      this.jsonRpcError(req, res, null, -32001, 'session not found — send a new initialize request', undefined, 404)
-      return
-    }
-    // Same here: the id resolved, so the session was used just now.
-    this.registry.touch(presentedSession)
     let body: Buffer
     try {
       body = await readBody(req)
@@ -731,8 +731,45 @@ export class McpStreamableHttpServer {
       this.jsonRpcError(req, res, message?.id ?? null, -32600, 'invalid request')
       return
     }
+
     const id = message.id ?? null
-    const sessionId = this.registry.sessionIdFor(req)
+    const headerSessionId = this.registry.sessionIdFor(req)
+    const rawArgumentSessionId = toolArgumentHubSessionId(message)
+    if (rawArgumentSessionId !== undefined && (typeof rawArgumentSessionId !== 'string' || rawArgumentSessionId.trim() === '')) {
+      this.jsonRpcError(req, res, id, -32602, 'hubSessionId must be a non-empty string')
+      return
+    }
+    const argumentSessionId = typeof rawArgumentSessionId === 'string' ? rawArgumentSessionId : undefined
+    if (headerSessionId !== undefined && argumentSessionId !== undefined && headerSessionId !== argumentSessionId) {
+      this.jsonRpcError(req, res, id, -32602, 'hubSessionId does not match Mcp-Session-Id header')
+      return
+    }
+    const sessionId = headerSessionId ?? argumentSessionId
+
+    if (authIdentity !== undefined) {
+      const bound = sessionId === undefined ? undefined : this.registry.tokenFor(sessionId)
+      // allow-join walk-ins present NO token on later requests: the sentinel
+      // identity ('__join__') must keep matching the session's already-minted
+      // unique anonymous peer. Only a real (non-anonymous) mismatch is fraud.
+      const bothAnonymous = bound?.anonymous === true && authIdentity.anonymous === true
+      if (bound !== undefined && !bothAnonymous && (bound.peer !== authIdentity.peer || bound.role !== authIdentity.role)) {
+        this.unauthorized(req, res, id, 'token does not match this session')
+        return
+      }
+      // A known session may still have no token binding yet (for example, one
+      // first minted by an SSE stream); never bind an unknown/stale session id.
+      if (sessionId !== undefined && this.registry.hasSession(sessionId) && bound === undefined && !authIdentity.anonymous) {
+        this.registry.bindToken(sessionId, authIdentity)
+      }
+    }
+
+    // A request presenting an unknown session id gets 404 so the client starts
+    // a new initialize cycle instead of carrying on under an id the hub forgot.
+    if (sessionId !== undefined && !this.registry.hasSession(sessionId)) {
+      this.jsonRpcError(req, res, id, -32001, 'session not found — send a new initialize request', undefined, 404)
+      return
+    }
+    this.registry.touch(sessionId)
     if (sessionId !== undefined) this.registry.sessionIps.set(sessionId, clientIp(req))
     // Loopback mode has no token table, so the manager secret is proven per request
     // and remembered on the session (bridge_register runs after initialize).
@@ -791,7 +828,7 @@ export class McpStreamableHttpServer {
             protocolVersion,
             capabilities: { tools: { listChanged: false } },
             serverInfo: { name: this.info.name, version: this.info.version },
-            instructions: 'You are already registered with the hub (auto-registered at connect). Use bridge_chat / bridge_task / bridge_wait / bridge_poll / bridge_status / bridge_peers / bridge_history / bridge_ack to talk to other agents; bridge_register(peerId) renames your identity.',
+            instructions: `You are already registered with the hub (auto-registered at connect). Use bridge_chat / bridge_task / bridge_wait / bridge_poll / bridge_status / bridge_peers / bridge_history / bridge_ack to talk to other agents; bridge_register(peerId) renames your identity. This connection's hubSessionId is ${newSessionId}. If the MCP transport does not preserve the Mcp-Session-Id HTTP header, include hubSessionId="${newSessionId}" in every tool call's arguments. Treat this value as a private per-connection capability and never share it with other connections.`,
           },
         }
       }
@@ -799,7 +836,7 @@ export class McpStreamableHttpServer {
         return { result: { tools: this.tools.map(tool => ({
           name: tool.name,
           description: tool.description,
-          inputSchema: tool.inputSchema,
+          inputSchema: inputSchemaWithHubSessionId(tool.inputSchema),
         })) } }
       case 'tools/call': {
         const params = (message.params ?? {}) as { name?: unknown; arguments?: unknown }
@@ -811,7 +848,9 @@ export class McpStreamableHttpServer {
           throw rpcError(-32602, 'tools/call arguments must be an object')
         }
         try {
-          const value = await tool.handler(args, sessionId)
+          const toolArgs = { ...args }
+          delete toolArgs.hubSessionId
+          const value = await tool.handler(toolArgs, sessionId)
           return { result: { content: [{ type: 'text', text: JSON.stringify(value) }], isError: false } }
         } catch (error) {
           return {

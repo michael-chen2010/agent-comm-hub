@@ -146,8 +146,8 @@ pnpm install          # install dev deps (typescript, esbuild, @types/node only)
 pnpm typecheck        # tsc --noEmit (strict, ES2023, no emit)
 pnpm test             # build + build:test (esbuild), then node test/smoke.mjs
                       #   + test/setup.mjs + test/ops.mjs + test/herdr.mjs
-                      #   + test/discover.mjs + test/e2e.mjs → 314 checks
-                      #   (169+46+11+35+33+20)
+                      #   + test/discover.mjs + test/e2e.mjs → 319 checks
+                      #   (174+46+11+35+33+20)
 npm run build:admin   # admin/ (npm, not pnpm) → the single-file assets/admin.html
 pnpm run build        # esbuild → lib/{cli,index,setup}.js (zero-dependency bundle)
 pnpm pack             # build + npm pack (publishing artifact)
@@ -164,12 +164,12 @@ pnpm pack             # build + npm pack (publishing artifact)
   an **ubuntu / windows / macos matrix**, `pnpm install --frozen-lockfile` →
   `typecheck` → `test` → `pack` → upload the tarball as an artifact.
 - After any edit, run at least `pnpm typecheck` and the affected suite; before
-  merging, the full `pnpm test` must stay green (verified: 169/169 + 46/46 +
+  merging, the full `pnpm test` must stay green (verified: 174/174 + 46/46 +
   11/11 + 35/35 + 33/33 + 20/20 on Node 24 / Windows).
 
 ## Testing
 
-- `test/smoke.mjs` (169 checks): three simulated agents over real MCP sessions
+- `test/smoke.mjs` (174 checks): three simulated agents over real MCP sessions
   against a live `startHub()` — registration, duplicate rejection, rename,
   chat routing, sender-filtered waits, task+ack routing back to the original
   sender, task delivery bookkeeping (`deliveredMs` for both the waiter handoff
@@ -193,7 +193,8 @@ pnpm pack             # build + npm pack (publishing artifact)
   persistence (stateFile write + restore), remote auth (401 without/unknown
   token, token identity overrides the
   client name, same-name users land on distinct peers with no mailbox
-  leak, token-bound rename rejection, manager-role token ops).
+  leak, token-bound rename rejection, manager-role token ops, and argument-carried
+  session IDs that cannot cross token identities).
 - `test/setup.mjs` (46 checks): `runSetup` against a fake home dir — only the
   `agent-hub` key is touched, unrelated config preserved, backups created,
   idempotency (a re-run must report it changed NO file — backup-name counting

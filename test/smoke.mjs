@@ -51,27 +51,49 @@ function assertLosslessJson(value, path = 'root') {
 
 /** One simulated agent: an MCP session with rpc helpers and a result parser.
  * `token` enables remote-auth mode (Authorization: Bearer). */
-function makeClient(name, base = BASE, token) {
+function makeClient(name, base = BASE, token, options = {}) {
   const headers = token === undefined ? {} : { Authorization: `Bearer ${token}` }
+  const sessionMode = options.sessionMode ?? 'header'
+  let sessionId
+  let initializeResult
   let id = 0
   return {
     name,
-    sessionId: () => headers['Mcp-Session-Id'],
+    sessionId: () => sessionId,
+    instructions: () => initializeResult?.instructions,
     async rpc(method, params) {
+      const outgoingHeaders = { 'Content-Type': 'application/json', Accept: 'application/json, text/event-stream', ...headers }
+      let outgoingParams = params
+      if (sessionMode === 'argument') {
+        delete outgoingHeaders['Mcp-Session-Id']
+        if (method === 'tools/call' && sessionId !== undefined) {
+          outgoingParams = {
+            ...params,
+            arguments: { ...(params?.arguments ?? {}), hubSessionId: sessionId },
+          }
+        }
+      }
       const res = await fetch(base, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', Accept: 'application/json, text/event-stream', ...headers },
-        body: JSON.stringify({ jsonrpc: '2.0', id: ++id, method, ...(params !== undefined ? { params } : {}) }),
+        headers: outgoingHeaders,
+        body: JSON.stringify({ jsonrpc: '2.0', id: ++id, method, ...(outgoingParams !== undefined ? { params: outgoingParams } : {}) }),
       })
       const text = await res.text()
       const sessionHeader = res.headers.get('mcp-session-id')
-      if (sessionHeader) headers['Mcp-Session-Id'] = sessionHeader
+      if (sessionHeader && sessionMode !== 'argument') {
+        headers['Mcp-Session-Id'] = sessionHeader
+        sessionId = sessionHeader
+      }
       let json = null
       try { json = JSON.parse(text) } catch { /* non-JSON */ }
       return { status: res.status, json, text }
     },
     async init() {
       const r = await this.rpc('initialize', { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: this.name, version: '1' } })
+      initializeResult = r.json?.result
+      if (sessionMode === 'argument') {
+        sessionId = initializeResult?.instructions?.match(/hubSessionId is ([^.]+)\./)?.[1]
+      }
       if (r.json?.result?.protocolVersion !== '2025-06-18') throw new Error(`${this.name} initialize failed: ${r.text}`)
       await this.rpc('notifications/initialized')
     },
@@ -348,6 +370,34 @@ try {
   const dePeers = await mavis.call('bridge_peers')
   const deIds = dePeers.peers.map(p => p.id).filter(id => id.startsWith('dupeager'))
   check('connect-time same-name sessions merge into one peer', JSON.stringify(deIds) === JSON.stringify(['dupeager']), JSON.stringify(deIds))
+
+  console.log('== session id in tool arguments ==')
+  const argOnly = makeClient('paramonly', BASE, undefined, { sessionMode: 'argument' })
+  await argOnly.init()
+  check(
+    'initialize instructions expose hubSessionId for argument-only transports',
+    typeof argOnly.sessionId() === 'string' && argOnly.instructions()?.includes(argOnly.sessionId()),
+    JSON.stringify({ sessionId: argOnly.sessionId(), instructions: argOnly.instructions() }),
+  )
+  const listed = await argOnly.rpc('tools/list')
+  const peersTool = listed.json?.result?.tools?.find(tool => tool.name === 'bridge_peers')
+  check(
+    'tools/list exposes hubSessionId as an optional argument',
+    peersTool?.inputSchema?.properties?.hubSessionId?.type === 'string',
+    JSON.stringify(peersTool?.inputSchema),
+  )
+  const paramReg = await argOnly.callRaw('bridge_register', { peerId: 'paramonly-renamed' })
+  check(
+    'tool call resolves session from hubSessionId when header is omitted',
+    paramReg.ok === true && paramReg.peerId === 'paramonly-renamed',
+    JSON.stringify(paramReg),
+  )
+  const mismatch = await mavis.rpc('tools/call', { name: 'bridge_peers', arguments: { hubSessionId: 'wrong-session' } })
+  check(
+    'conflicting header and hubSessionId are rejected',
+    mismatch.json?.error?.code === -32602,
+    JSON.stringify(mismatch.json),
+  )
 
   console.log('== liveness semantics (SSE counts as connected) ==')
   const hubSse = startHub({ port: 18999, connectedWindowMs: 400, peerIdleTimeoutMs: 60_000, waitTimeoutMs: 2000, maxQueue: 10, historyLimit: 10 }, { info: () => {}, warn: () => {} })
@@ -672,6 +722,13 @@ try {
     const zsRow = rosterA.peers.find(p => p.id === 'zhangsan')
     check('token identity overrides the client-reported name', zsRow?.clientName === 'kimi-code', JSON.stringify(rosterA))
     check('same-name clients land on distinct token peers', rosterA.peers.some(p => p.id === 'lisi') && rosterA.peers.some(p => p.id === 'ops-admin'), JSON.stringify(rosterA))
+
+    const argumentSessionHijack = await fetch(authBase, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Accept: 'application/json, text/event-stream', Authorization: 'Bearer ls-token-0123456789abcdef' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'bridge_peers', arguments: { hubSessionId: zs.sessionId() } } }),
+    })
+    check('argument session id cannot be used with another token', argumentSessionHijack.status === 401, String(argumentSessionHijack.status))
 
     // The R0 leak, closed: one token user's message must NOT reach another's mailbox.
     await zs.call('bridge_chat', { to: 'zhangsan', message: '张三的交接任务' })
