@@ -402,9 +402,9 @@ export function hubTools(hub: AgentHub, registry: SessionRegistry, options: HubT
   return [
     {
       name: 'bridge_register',
-      description: 'Create an independent logical Hub session or rename the identity bound to the supplied agentSessionToken. On first registration, pass a random UUID v4 registrationRequestId and a peerId (unless a bearer identity supplies the peerId). The successful result returns a private agentSessionToken; every subsequent tool call must include that exact token. MCP transport session headers never determine business identity. Optionally set a display alias. Rejects duplicate peer ids and reused registrationRequestIds with different identity data.',
+      description: 'Create an independent logical Hub session or rename the identity bound to the supplied agentSessionToken. For first registration, omit agentSessionToken and pass a fresh UUID v4 registrationRequestId plus peerId unless a bearer identity supplies peerId. For an existing session, pass agentSessionToken; registrationRequestId is not needed and peerId may be omitted to keep the current id. The server enforces these conditional requirements. The successful result returns a private agentSessionToken; every subsequent tool call must include that exact token. MCP transport session headers never determine business identity. Optionally set a display alias. Rejects duplicate peer ids and reused registrationRequestIds with different identity data.',
       inputSchema: schema({
-        peerId: optStr('Peer id for first registration: letters/digits/._:-, 1-64 chars. Required for local unauthenticated clients; bearer-authenticated clients may omit it to use their bound identity.'),
+        peerId: optStr('For first registration without agentSessionToken, required for local unauthenticated clients; bearer-authenticated clients may omit it to use their bound identity. With agentSessionToken, omit it to keep the current peer id or provide a new id where renaming is permitted. Valid characters: letters/digits/._:-, 1-64 chars.'),
         alias: optStr('Optional display name (1-64 chars, spaces/CJK allowed). Routing still uses peerId.'),
       }),
       handler: async (args: Record<string, unknown>, sessionId: string | undefined) => {

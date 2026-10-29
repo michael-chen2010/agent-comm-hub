@@ -89,12 +89,14 @@ function inputSchemaWithAgentSessionToken(schema: Record<string, unknown>, toolN
   const agentSessionToken = {
     type: 'string',
     minLength: 36,
-    description: 'Required logical Hub session capability returned by bridge_register. Pass the exact token returned for this AI on every tool call; never reuse another AI connection\'s token.',
+    description: toolName === 'bridge_register'
+      ? 'Optional for a first registration. If supplied, this must be an active token and registrationRequestId is not required; otherwise the server requires registrationRequestId and peerId unless a bearer identity supplies peerId.'
+      : 'Required logical Hub session capability returned by bridge_register. Pass the exact token returned for this AI on every tool call; never reuse another AI connection\'s token.',
   }
   if (toolName === 'bridge_register') {
     return {
       ...schema,
-      required: originalRequired.filter(item => item !== 'peerId'),
+      required: originalRequired.filter(item => item !== 'peerId' && item !== 'registrationRequestId' && item !== 'agentSessionToken'),
       properties: {
         ...properties,
         agentSessionToken,
@@ -102,13 +104,9 @@ function inputSchemaWithAgentSessionToken(schema: Record<string, unknown>, toolN
           type: 'string',
           format: 'uuid',
           pattern: REGISTRATION_REQUEST_ID.source,
-          description: 'Required only for first registration when agentSessionToken is absent. Generate and retain a random UUID v4; while the same Hub process is running, retrying the same registration returns the same capability.',
+          description: 'Required for first registration when agentSessionToken is absent. Must be a random UUID v4. Retrying the same request id in the same Hub process returns the same capability for the same peer; do not reuse it for a different identity.',
         },
       },
-      anyOf: [
-        { required: ['agentSessionToken'] },
-        { required: ['registrationRequestId'] },
-      ],
     }
   }
   return {

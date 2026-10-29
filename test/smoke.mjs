@@ -457,11 +457,18 @@ try {
   )
   const registerTool = listed.json?.result?.tools?.find(tool => tool.name === 'bridge_register')
   check(
-    'bridge_register schema requires either a first-registration UUID or an existing token',
-    registerTool?.inputSchema?.properties?.registrationRequestId?.format === 'uuid'
+    'bridge_register exposes a flat object schema with typed fields and conditional guidance',
+    registerTool?.inputSchema?.type === 'object'
+      && registerTool?.inputSchema?.anyOf === undefined
+      && registerTool?.inputSchema?.properties?.peerId?.type === 'string'
+      && typeof registerTool?.inputSchema?.properties?.peerId?.description === 'string'
+      && registerTool?.inputSchema?.properties?.alias?.type === 'string'
+      && typeof registerTool?.inputSchema?.properties?.alias?.description === 'string'
+      && registerTool?.inputSchema?.properties?.agentSessionToken?.type === 'string'
+      && typeof registerTool?.inputSchema?.properties?.agentSessionToken?.description === 'string'
+      && registerTool?.inputSchema?.properties?.registrationRequestId?.format === 'uuid'
       && registerTool?.inputSchema?.properties?.registrationRequestId?.pattern?.includes('-4[0-9a-fA-F]{3}-') === true
-      && registerTool?.inputSchema?.anyOf?.some(branch => branch.required?.includes('registrationRequestId')) === true
-      && registerTool?.inputSchema?.anyOf?.some(branch => branch.required?.includes('agentSessionToken')) === true,
+      && typeof registerTool?.inputSchema?.properties?.registrationRequestId?.description === 'string',
     JSON.stringify(registerTool?.inputSchema),
   )
   const noHeaderRpc = async (method, params) => {
@@ -472,6 +479,15 @@ try {
     })
     return { status: response.status, json: await response.json() }
   }
+  const missingRequestId = await noHeaderRpc('tools/call', {
+    name: 'bridge_register', arguments: { peerId: 'missing-request-id' },
+  })
+  const missingRequestIdResult = JSON.parse(missingRequestId.json?.result?.content?.[0]?.text ?? '{}')
+  check(
+    'server enforces first-registration requirements without schema anyOf',
+    missingRequestId.json?.result?.isError === true && /registrationRequestId/.test(missingRequestIdResult.error ?? ''),
+    JSON.stringify(missingRequestIdResult),
+  )
   const requestId = crypto.randomUUID()
   const regWithoutHeader = await noHeaderRpc('tools/call', {
     name: 'bridge_register', arguments: { peerId: 'paramonly-renamed', registrationRequestId: requestId },
@@ -491,6 +507,19 @@ try {
     peersWithToken.json?.result?.isError !== true
       && JSON.parse(peersWithToken.json?.result?.content?.[0]?.text ?? '{}').peers?.some(p => p.id === 'paramonly-renamed') === true,
     JSON.stringify(peersWithToken.json),
+  )
+  const registerWithExistingToken = await noHeaderRpc('tools/call', {
+    name: 'bridge_register',
+    arguments: { agentSessionToken: regResult.agentSessionToken, alias: 'token-only-reregister' },
+  })
+  const registerAgainResult = JSON.parse(registerWithExistingToken.json?.result?.content?.[0]?.text ?? '{}')
+  check(
+    'existing token can re-register without registrationRequestId',
+    registerWithExistingToken.json?.result?.isError !== true
+      && registerAgainResult.ok === true
+      && registerAgainResult.peerId === 'paramonly-renamed'
+      && registerAgainResult.alias === 'token-only-reregister',
+    JSON.stringify(registerAgainResult),
   )
   const peersWithoutToken = await noHeaderRpc('tools/call', { name: 'bridge_peers', arguments: {} })
   const missingTokenResult = JSON.parse(peersWithoutToken.json?.result?.content?.[0]?.text ?? '{}')
