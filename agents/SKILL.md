@@ -62,9 +62,10 @@ response is lost while the same Hub process is running, retry with the same UUID
   work to. Returns matches with their current load (`queued` / `waiting` /
   `running`); by default only peers that accept tasks.
 - `bridge_wait(from?, ref?, threadId?, timeoutMs?, ack?, maxMessages?)` — long-poll for the next
-  message (default 30 s; `ref` waits for that task's ack; `threadId` narrows
-  to one dialog). Loop it to hold a real-time conversation. `ack: "manual"`
-  LEASES the message instead of consuming it.
+  message (default 40 s; the default server ceiling is 45 s, leaving headroom under
+  common 60 s MCP tool-call limits). `ref` waits for that task's ack; `threadId`
+  narrows to one dialog. A timeout returns retry guidance; call `bridge_wait` again
+  while the conversation is active. `ack: "manual"` LEASES the message instead of consuming it.
 - `bridge_poll(from?, ack?)` — non-blocking drain of every queued message.
 - `bridge_commit(ids)` — confirm you have finished with leased messages. Until you
   do, they are handed out again when the lease expires (with `attempts` growing),
@@ -91,7 +92,8 @@ response is lost while the same Hub process is running, retry with the same UUID
    do NOT guess a peerId or send blindly; tell the user the other agent needs
    to be running (it registers automatically on connect).
 3. Receiving: try `bridge_poll()` first; if empty, loop `bridge_wait()` until
-   a message arrives or you give up.
+   a message arrives or the user explicitly ends the wait. A normal timeout is not
+   a reason to stop the conversation.
 4. On receiving a `task` (content is `{prompt, context?, deliverable?}`):
    - `bridge_ack(ref, "accepted")` when you take it on
    - `bridge_ack(ref, "working", note?, progress?)` for long-running work
@@ -127,7 +129,7 @@ Follow the scenario directly (tool names stay as-is):
 - After you've said your piece, stay in the conversation: loop
   `bridge_wait()` to keep listening — nothing arrived this round, wait the
   next — until a conclusion is reached or the user says "done".
-- A timeout (`{type:"timeout"}`) is not a failure; keep waiting.
+- A timeout (`{type:"timeout"}`) is a normal retryable result, not a failure or task completion. Use its `nextAction` and call `bridge_wait` again, preserving the same filters.
 - Optional: put the dialog on one `threadId` so `bridge_wait({threadId})`
   only sees that conversation.
 
@@ -135,10 +137,12 @@ Follow the scenario directly (tool names stay as-is):
 
 - Messages travel on loopback only (127.0.0.1:18764) in local mode; never put
   credentials in bridge messages.
-- A timeout is not a failure: `bridge_wait` returning `{type:"timeout"}` just
-  means nothing arrived — try again.
-- Cadence: use 10–30 s short polls when the peer is active; check
-  `bridge_peers()` when unsure.
+- A timeout is not a failure: the result includes `retryable: true`,
+  `taskCompleted: false`, and a `nextAction` instruction. If you are still waiting,
+  call `bridge_wait` again and preserve `from` / `ref` / `threadId` filters.
+- The default wait window is 40 s and the default server ceiling is 45 s. Keep
+  each call comfortably below the configured MCP client's tool-call timeout; check
+  `bridge_peers()` when unsure whether the other peer is online.
 - Task terminal states (`done`/`failed`/`rejected`/`timeout`) cannot be
   reopened; start a new task instead of re-acking.
 - **Reply chains are counted, not enforced — nothing is ever refused.**

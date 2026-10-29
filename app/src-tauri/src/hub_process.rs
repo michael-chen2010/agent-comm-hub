@@ -143,8 +143,8 @@ impl Default for HubConfig {
             // silently shrink the hub's ring — and the ring is the 3s poll's fallback source
             // (100 messages evict within seconds under dense agent chatter).
             history_limit: 1000,
-            wait_timeout_ms: 60_000,
-            default_wait_ms: 30_000,
+            wait_timeout_ms: 45_000,
+            default_wait_ms: 40_000,
             connected_window_ms: 30_000,
             peer_idle_timeout_ms: 600_000,
             herdr_bin: None,
@@ -699,8 +699,8 @@ mod tests {
         assert_eq!(cfg.path, "/mcp");
         assert_eq!(cfg.max_queue, 200);
         assert_eq!(cfg.history_limit, 1000);
-        assert_eq!(cfg.wait_timeout_ms, 60_000);
-        assert_eq!(cfg.default_wait_ms, 30_000);
+        assert_eq!(cfg.wait_timeout_ms, 45_000);
+        assert_eq!(cfg.default_wait_ms, 40_000);
         assert_eq!(cfg.connected_window_ms, 30_000);
         assert_eq!(cfg.peer_idle_timeout_ms, 600_000);
     }

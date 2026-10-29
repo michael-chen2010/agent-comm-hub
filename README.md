@@ -42,7 +42,7 @@ Zero runtime dependencies: the MCP streamable-http server is hand-rolled over `n
 
 - **Any agent, one config**: every client points at the same `streamable-http` URL — no per-pair wiring.
 - **Reliable identity**: the sender of every message is derived from the registered logical-session capability, never caller-supplied — peers cannot impersonate each other; duplicate ids are rejected. MCP `initialize` opens the transport only; each client must call `bridge_register` and send the returned private `agentSessionToken` with every later tool call. Peers carry a profile (client name/version, display alias) and joins/leaves are pushed over SSE.
-- **Real-time by polling**: `bridge_wait` long-polls (default 30 s, server ceiling 60 s); messages queue for offline peers.
+- **Real-time by polling**: `bridge_wait` long-polls (default 40 s, server ceiling 45 s by default). A timeout is a retryable result (`retryable: true`, `taskCompleted: false`, `nextAction`); agents should call again while still waiting. Messages queue for offline peers.
 - **Structured conversations**: `chat` / `task` / `notice` / `ack` message kinds, acks auto-routed back to the original sender, `to: "all"` broadcast.
 - **Hard control via herdr** (optional): when the [herdr](https://herdr.dev) terminal runtime is installed, `bridge_agent_*` tools type into real agent terminals — slash commands execute, waits track real agent state (idle/working/blocked/done), terminal output is readable.
 - **Zero dependencies, one process**: `npx agent-comm-hub` — no database, no daemon, no external services.
@@ -258,7 +258,7 @@ with `agent-comm-hub setup --remove` (or only refresh skills via
 | `bridge_notice(to, message, level?)` | Send a system-flavoured notice (`info`/`warn`/`error`) — read as a status, not as chat; creates no task |
 | `bridge_task(to, prompt, context?, deliverable?, timeoutMs?, threadId?, ref?, expiresAt?)` | Delegate a structured task (`timeoutMs` is the assignee's SLA once it arrives; `expiresAt` is the delivery deadline) |
 | `bridge_ack(ref, status, note?, progress?)` | Acknowledge a task (`accepted`/`working`/`rejected`/`done`/`failed`), routed back to the original sender |
-| `bridge_wait(from?, ref?, threadId?, timeoutMs?, ack?, maxMessages?)` | Long-poll for the next message (default 30 s). `ack: "manual"` leases it instead of consuming it; `maxMessages > 1` returns `{type:"messages", messages:[…]}` in one call |
+| `bridge_wait(from?, ref?, threadId?, timeoutMs?, ack?, maxMessages?)` | Long-poll for the next message (default 40 s; server ceiling 45 s by default). A timeout returns retry guidance and does not mean the task is complete; call again if still waiting. `ack: "manual"` leases it instead of consuming it; `maxMessages > 1` returns `{type:"messages", messages:[…]}` in one call |
 | `bridge_poll(from?, ack?)` | Non-blocking drain of queued messages (`ack: "manual"` leases them) |
 | `bridge_commit(ids)` | Acknowledge leased messages; uncommitted ones come back when the lease expires |
 | `bridge_nack(ids)` | Give leased (or dead-lettered) messages back immediately — use when handling failed |
@@ -369,8 +369,8 @@ agent-comm-hub service install|uninstall [options]   one-shot auto-start
 --path <p>               MCP endpoint path (default /mcp)
 --max-queue <n>          Queued messages per peer before dropping oldest (default 200)
 --history-limit <n>      Retained history messages (default 1000)
---wait-timeout-ms <n>    Long-poll ceiling for bridge_wait (default 60000)
---default-wait-ms <n>    bridge_wait default budget (default 30000)
+--wait-timeout-ms <n>    Long-poll ceiling for bridge_wait (default 45000)
+--default-wait-ms <n>    bridge_wait default budget (default 40000)
 --connected-window-ms <n>  Peer counts as active within this window (default 30000)
 --peer-idle-timeout-ms <n> Park (not delete) idle peers after this; 0 disables the GC
                          entirely (default 600000)

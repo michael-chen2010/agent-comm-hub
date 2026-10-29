@@ -44,7 +44,7 @@ export interface McpTool {
   /** Plain JSON Schema (standard dialect: `required` arrays). */
   inputSchema: Record<string, unknown>
   /** Execute one call; `sessionId` is the caller's MCP session (may be undefined). */
-  handler: (args: Record<string, unknown>, sessionId: string | undefined) => Promise<unknown>
+  handler: (args: Record<string, unknown>, sessionId: string | undefined, signal?: AbortSignal) => Promise<unknown>
 }
 
 /** Protocol versions this server can speak, newest first. */
@@ -471,6 +471,8 @@ export interface OriginPolicy {
 /** A minimal MCP server bound to one URL path of an http.Server. */
 export class McpStreamableHttpServer {
   private readonly sseStreams = new Map<string, ServerResponse>()
+  /** In-flight tool calls, keyed by transport session + JSON-RPC request id. */
+  private readonly pendingToolCalls = new Map<string, AbortController>()
   private heartbeatTimer: NodeJS.Timeout | undefined
   private sessionSweepTimer: NodeJS.Timeout | undefined
 
@@ -504,6 +506,11 @@ export class McpStreamableHttpServer {
      *  registry forgets it. `0` disables reaping. See {@link SessionRegistry.sweep}. */
     private readonly sessionTtlMs: number = DEFAULT_SESSION_TTL_MS,
   ) {}
+
+  /** JSON-RPC ids are only unique within one MCP transport session. */
+  private pendingRequestKey(sessionId: string, id: string | number): string {
+    return JSON.stringify([sessionId, typeof id, id])
+  }
 
   /** Does this request carry the loopback manager token? */
   private presentedManagerToken(req: IncomingMessage): boolean {
@@ -597,6 +604,8 @@ export class McpStreamableHttpServer {
   close(): void {
     if (this.heartbeatTimer !== undefined) clearInterval(this.heartbeatTimer)
     if (this.sessionSweepTimer !== undefined) clearInterval(this.sessionSweepTimer)
+    for (const controller of this.pendingToolCalls.values()) controller.abort()
+    this.pendingToolCalls.clear()
     for (const stream of this.sseStreams.values()) stream.end()
     this.sseStreams.clear()
   }
@@ -907,10 +916,37 @@ export class McpStreamableHttpServer {
       }
     }
 
+    // MCP cancellation is a notification (no id) that names the original
+    // JSON-RPC request id. Scope it to the same transport session so one peer
+    // cannot cancel another peer's in-flight call by reusing its request id.
+    if (message.method === 'notifications/cancelled') {
+      const params = typeof message.params === 'object' && message.params !== null && !Array.isArray(message.params)
+        ? message.params as { requestId?: unknown }
+        : undefined
+      const requestId = params?.requestId
+      if (transportSessionId !== undefined && (typeof requestId === 'string' || typeof requestId === 'number')) {
+        this.pendingToolCalls.get(this.pendingRequestKey(transportSessionId, requestId))?.abort()
+      }
+    }
+
     // Notifications carry no id: acknowledge and move on.
     if (id === null) {
       res.writeHead(202, { ...this.corsFor(req), 'Content-Length': '0' }).end()
       return
+    }
+
+    const requestController = message.method === 'tools/call' ? new AbortController() : undefined
+    const requestKey = requestController !== undefined && transportSessionId !== undefined
+      ? this.pendingRequestKey(transportSessionId, id)
+      : undefined
+    const abortOnClose = (): void => {
+      // `close` also fires after a normal response; only abort a call whose
+      // client disappeared before the response completed.
+      if (!res.writableEnded) requestController?.abort()
+    }
+    if (requestController !== undefined) {
+      if (requestKey !== undefined) this.pendingToolCalls.set(requestKey, requestController)
+      res.on('close', abortOnClose)
     }
 
     try {
@@ -920,7 +956,9 @@ export class McpStreamableHttpServer {
         authIdentity,
         this.presentedManagerToken(req),
         clientIp(req),
+        requestController?.signal,
       )
+      if (res.destroyed || res.writableEnded) return
       res.writeHead(200, {
         ...this.corsFor(req),
         'Content-Type': 'application/json; charset=utf-8',
@@ -929,8 +967,14 @@ export class McpStreamableHttpServer {
       })
       res.end(JSON.stringify({ jsonrpc: '2.0', id, result }))
     } catch (error) {
+      if (res.destroyed || res.writableEnded) return
       const code = (error as { code?: number }).code ?? -32603
       this.jsonRpcError(req, res, id, code, (error as Error).message)
+    } finally {
+      if (requestKey !== undefined && this.pendingToolCalls.get(requestKey) === requestController) {
+        this.pendingToolCalls.delete(requestKey)
+      }
+      if (requestController !== undefined) res.off('close', abortOnClose)
     }
   }
 
@@ -940,6 +984,7 @@ export class McpStreamableHttpServer {
     authIdentity?: TokenIdentity,
     managerTokenPresented = false,
     requestIp = '',
+    requestSignal?: AbortSignal,
   ): Promise<{ result: unknown; extraHeaders?: Record<string, string> }> {
     const method = message.method ?? ''
     switch (method) {
@@ -1032,7 +1077,8 @@ export class McpStreamableHttpServer {
 
           delete toolArgs.agentSessionToken
           delete toolArgs.registrationRequestId
-          const value = await tool.handler(toolArgs, logicalSessionId)
+          const value = await tool.handler(toolArgs, logicalSessionId, requestSignal)
+          if (requestSignal?.aborted) throw rpcError(-32800, 'Request cancelled')
           let output = value
           if (tool.name === 'bridge_register' && typeof value === 'object' && value !== null && !Array.isArray(value)) {
             output = { ...(value as Record<string, unknown>), agentSessionToken: logicalSessionId }
@@ -1043,6 +1089,7 @@ export class McpStreamableHttpServer {
           return { result: { content: [{ type: 'text', text: JSON.stringify(output) }], isError: false } }
         } catch (error) {
           if (createdAgentSession && logicalSessionId !== undefined) this.registry.revokeAgentSession(logicalSessionId)
+          if (requestSignal?.aborted) throw rpcError(-32800, 'Request cancelled')
           return {
             result: {
               content: [{ type: 'text', text: JSON.stringify({ error: (error as Error).message }) }],

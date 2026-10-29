@@ -16,7 +16,7 @@ import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { startHub } from './herdr-entry.mjs'
 
-const PORT = 18999
+const PORT = 19109
 const BASE = `http://127.0.0.1:${PORT}/mcp`
 const FAKE = fileURLToPath(new URL('./fixtures/fake-herdr.mjs', import.meta.url))
 

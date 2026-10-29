@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- `bridge_wait` defaults to a 40-second window with a 45-second server ceiling; timeout results now include explicit retry guidance and do not imply task completion.
+- MCP cancellation notifications and client disconnects abort in-flight tool calls so cancelled waits cannot consume messages arriving later.
+
 ## 0.10.1 (2026-10-22)
 
 - **Explicit logical-session capability**: `initialize` establishes only the MCP transport session. `bridge_register` returns a private `agentSessionToken`, which is required in every subsequent bridge tool call; `registrationRequestId` makes first registration retry-safe. The standard `Mcp-Session-Id` header remains transport-only for HTTP/SSE and never selects the business peer. Remote Bearer identity is validated independently against both the transport session and logical capability.

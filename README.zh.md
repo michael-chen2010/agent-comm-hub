@@ -42,7 +42,7 @@
 
 - **任意 agent,一份配置**：所有客户端指向同一个 `streamable-http` URL，无需两两接线
 - **可靠身份**：消息的 `from` 由 hub 根据已注册的逻辑会话注入，客户端无法伪造；重名 peer id 会被拒绝。MCP `initialize` 只建立传输会话；客户端必须显式调用 `bridge_register`，并在之后每次工具调用中携带返回的私有 `agentSessionToken`。每个 peer 带档案（客户端名/版本、显示别名），上下线与改名通过 SSE 实时推送
-- **轮询即实时**：`bridge_wait` 长轮询（默认 30s，服务端上限 60s）；离线 agent 的消息排队等它
+- **轮询即实时**：`bridge_wait` 长轮询（默认 40s，服务端默认上限 45s）。超时是可重试结果（`retryable: true`、`taskCompleted: false`、`nextAction`），仍在等待时应再次调用；离线 agent 的消息会排队
 - **结构化会话**：`chat` / `task` / `notice` / `ack` 四类消息；回执自动路由回原发送者；`to: "all"` 广播
 - **herdr 硬控制**（可选）：装了 [herdr](https://herdr.dev) 终端运行时后，`bridge_agent_*` 工具能直接往对方终端打字——斜杠命令真实执行、等待基于真实 agent 状态（idle/working/blocked/done）、可读终端输出
 - **零依赖单进程**：`npx agent-comm-hub` —— 无数据库、无守护、无外部服务
@@ -170,7 +170,7 @@ agent-comm-hub service uninstall
 | `bridge_chat(to, message)` | 发消息；`to: "all"` 广播 |
 | `bridge_task(to, prompt, context?, deliverable?)` | 派结构化任务 |
 | `bridge_ack(ref, status, note?)` | 回执（accepted/rejected/done/failed），自动回到原发送者 |
-| `bridge_wait(from?, timeoutMs?)` | 长轮询收下一条消息（默认 30s；循环=实时监听） |
+| `bridge_wait(from?, timeoutMs?)` | 长轮询收下一条消息（默认 40s，服务端默认上限 45s）；超时返回重试提示，不代表任务完成；仍在等待时应再次调用 |
 | `bridge_poll(from?)` | 非阻塞取走所有排队消息 |
 | `bridge_status()` | 枢纽健康：各 peer 在线/队列/等待状态 |
 | `bridge_peers()` | 谁在线 |
@@ -229,8 +229,8 @@ agent-comm-hub service install|uninstall [options]   一键自启
 --path <p>                MCP 路径（默认 /mcp）
 --max-queue <n>           每 peer 队列上限，溢出丢最旧（默认 200）
 --history-limit <n>       保留的历史条数（默认 1000）
---wait-timeout-ms <n>     bridge_wait 长轮询上限（默认 60000）
---default-wait-ms <n>     bridge_wait 默认预算（默认 30000）
+--wait-timeout-ms <n>     bridge_wait 长轮询上限（默认 45000）
+--default-wait-ms <n>     bridge_wait 默认预算（默认 40000）
 --connected-window-ms <n> 活跃窗口（默认 30000）
 --peer-idle-timeout-ms <n> 空闲 GC 超时；0 关闭（默认 600000）
 --herdr-bin <path>        bridge_agent_* 控制工具的 herdr CLI 二进制

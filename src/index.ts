@@ -147,8 +147,9 @@ export const DEFAULT_CONFIG: HubConfig = {
   // only archive source until the desktop app persists it to SQLite, and a
   // night of agent-to-agent chatter evicts everything within minutes.
   historyLimit: 1000,
-  waitTimeoutMs: 60_000,
-  defaultWaitMs: 30_000,
+  // Keep each long-poll below common 60s MCP tool-call limits with room for transport overhead.
+  waitTimeoutMs: 45_000,
+  defaultWaitMs: 40_000,
   connectedWindowMs: 30_000,
   peerIdleTimeoutMs: 600_000,
   // The companion desktop app (and `agent-comm-hub status` probe) registers

@@ -8,7 +8,7 @@
  *   node test/smoke.mjs
  */
 
-import { startHub } from './entry.mjs'
+import { startHub, DEFAULT_CONFIG, DEFAULT_WAIT_MS } from './entry.mjs'
 import { randomUUID } from 'node:crypto'
 import { tmpdir } from 'node:os'
 import { readFileSync, rmSync, writeFileSync, existsSync } from 'node:fs'
@@ -27,6 +27,12 @@ function check(name, ok, detail = '') {
     console.error(`  FAIL  ${name}${detail ? ` — ${detail}` : ''}`)
   }
 }
+
+check(
+  'default bridge_wait window is 40s with a 45s server ceiling',
+  DEFAULT_WAIT_MS === 40_000 && DEFAULT_CONFIG.defaultWaitMs === 40_000 && DEFAULT_CONFIG.waitTimeoutMs === 45_000,
+  JSON.stringify({ defaultWaitMs: DEFAULT_CONFIG.defaultWaitMs, waitTimeoutMs: DEFAULT_CONFIG.waitTimeoutMs, toolDefaultWaitMs: DEFAULT_WAIT_MS }),
+)
 
 /** Reject anything a strict tool registry (e.g. DSH) would reject as lossy JSON. */
 function assertLosslessJson(value, path = 'root') {
@@ -354,7 +360,52 @@ try {
   check('peer can re-register', reborn.peers.length === 3, JSON.stringify(reborn))
 
   const timeout = await mavis.call('bridge_wait', { timeoutMs: 200 })
-  check('wait timeout shape', timeout.type === 'timeout' && typeof timeout.waitedMs === 'number', JSON.stringify(timeout))
+  check('wait timeout gives an explicit retry instruction', timeout.type === 'timeout' && typeof timeout.waitedMs === 'number' && timeout.retryable === true && typeof timeout.message === 'string' && typeof timeout.nextAction === 'string' && timeout.taskCompleted === false, JSON.stringify(timeout))
+
+  // Cancel a live wait via the MCP-standard notification, then ensure a later
+  // message remains queued instead of being consumed by the cancelled waiter.
+  const cancelRequestId = `cancel-wait-${randomUUID()}`
+  const cancelHeaders = {
+    'Content-Type': 'application/json',
+    Accept: 'application/json, text/event-stream',
+    'Mcp-Session-Id': mavis.sessionId(),
+  }
+  const pendingCancelledWait = fetch(BASE, {
+    method: 'POST',
+    headers: cancelHeaders,
+    body: JSON.stringify({
+      jsonrpc: '2.0', id: cancelRequestId, method: 'tools/call',
+      params: { name: 'bridge_wait', arguments: { timeoutMs: 2000, agentSessionToken: mavis.agentSessionToken() } },
+    }),
+  })
+  await new Promise(resolve => setTimeout(resolve, 100))
+  await fetch(BASE, {
+    method: 'POST',
+    headers: cancelHeaders,
+    body: JSON.stringify({ jsonrpc: '2.0', method: 'notifications/cancelled', params: { requestId: cancelRequestId, reason: 'regression test' } }),
+  })
+  await opencode.call('bridge_chat', { to: 'mavis', message: 'message after cancelled wait' })
+  const cancelledResponse = await pendingCancelledWait
+  const cancelledBody = await cancelledResponse.json()
+  const mailboxAfterCancel = await mavis.call('bridge_poll')
+  check('cancelled bridge_wait returns a cancellation error and preserves later messages', cancelledResponse.status === 200 && cancelledBody.error?.code === -32800 && mailboxAfterCancel.messages.some(message => message.content === 'message after cancelled wait'), JSON.stringify({ cancelledBody, messages: mailboxAfterCancel.messages }))
+
+  const disconnectRequestId = `disconnect-wait-${randomUUID()}`
+  const disconnectController = new AbortController()
+  const pendingDisconnectedWait = fetch(BASE, {
+    method: 'POST', headers: cancelHeaders, signal: disconnectController.signal,
+    body: JSON.stringify({
+      jsonrpc: '2.0', id: disconnectRequestId, method: 'tools/call',
+      params: { name: 'bridge_wait', arguments: { timeoutMs: 2000, agentSessionToken: mavis.agentSessionToken() } },
+    }),
+  }).then(async response => ({ status: response.status, text: await response.text() }), error => ({ errorName: error.name }))
+  await new Promise(resolve => setTimeout(resolve, 100))
+  disconnectController.abort()
+  const disconnectOutcome = await pendingDisconnectedWait
+  await new Promise(resolve => setTimeout(resolve, 50))
+  await opencode.call('bridge_chat', { to: 'mavis', message: 'message after disconnected wait' })
+  const mailboxAfterDisconnect = await mavis.call('bridge_poll')
+  check('client disconnect aborts bridge_wait without consuming later messages', disconnectOutcome.errorName === 'AbortError' && mailboxAfterDisconnect.messages.some(message => message.content === 'message after disconnected wait'), JSON.stringify({ disconnectOutcome, messages: mailboxAfterDisconnect.messages }))
 
   const badStatus = await mavis.callRaw('bridge_ack', { ref: 'does-not-exist', status: 'done' })
   check('ack of unknown ref rejected', badStatus.error !== undefined, JSON.stringify(badStatus))
@@ -515,9 +566,9 @@ try {
   console.log('== profiles, aliases, and manager ops ==')
   // Fresh hub: DEFAULT_CONFIG managers default to the desktop identity
   // ('agent-hub-cli'), so the mgr client below is the manager out of the box.
-  const hubMgmt = startHub({ port: 19001, waitTimeoutMs: 2000, maxQueue: 10, historyLimit: 20, connectedWindowMs: 60_000 }, { info: () => {}, warn: () => {} })
+  const hubMgmt = startHub({ port: 19101, waitTimeoutMs: 2000, maxQueue: 10, historyLimit: 20, connectedWindowMs: 60_000 }, { info: () => {}, warn: () => {} })
   try {
-    const base = 'http://127.0.0.1:19001/mcp'
+    const base = 'http://127.0.0.1:19101/mcp'
     const mgr = makeClient('agent-hub-cli', base)
     const alice = makeClient('alice', base)
     const bob = makeClient('bob', base)

@@ -11,7 +11,7 @@ import { AGENT_STATUSES, type HerdrCtl } from './herdr-ctl.js'
 import { CLIENT_ACK_STATUSES, a2aState, decodeContent, encodeContent, type AckContent, type AckStatus, type BridgeMessage, BROADCAST, HUB_PEER, type NoticeContent, type NoticeLevel, PEER_ID_PATTERN, type PeerCard, type TaskArtifact, type TaskContent, type TaskStatus, type WaitResult } from './protocol.js'
 
 /** Default wait budget when a client omits timeoutMs. */
-export const DEFAULT_WAIT_MS = 30_000
+export const DEFAULT_WAIT_MS = 40_000
 
 /** Message presented to a model: task/ack payloads decoded to objects.
  *  Undefined `ref` is dropped — lossy JSON values are rejected by strict
@@ -324,7 +324,13 @@ export function hubTools(hub: AgentHub, registry: SessionRegistry, options: HubT
   })
 
   const presentWait = (result: WaitResult): unknown => {
-    if (result.type === 'timeout') return result
+    if (result.type === 'timeout') return {
+      ...result,
+      retryable: true,
+      message: 'No matching message arrived during this wait window. This is a normal polling result, not an error or task completion.',
+      nextAction: 'Call bridge_wait again, preserving the same from/ref/threadId filters. Continue until a matching message arrives or the user explicitly ends the conversation.',
+      taskCompleted: false,
+    }
     if (result.type === 'messages') return { type: 'messages', messages: result.messages.map(present) }
     return { type: 'message', message: present(result.message) }
   }
@@ -387,10 +393,10 @@ export function hubTools(hub: AgentHub, registry: SessionRegistry, options: HubT
     }
   }
 
-  const wrap = (peerAware: boolean, handler: (args: Record<string, unknown>, peer: string, sessionId: string | undefined) => Promise<unknown>): McpTool['handler'] =>
-    async (args, sessionId) => {
+  const wrap = (peerAware: boolean, handler: (args: Record<string, unknown>, peer: string, sessionId: string | undefined, signal?: AbortSignal) => Promise<unknown>): McpTool['handler'] =>
+    async (args, sessionId, signal) => {
       const peer = peerAware ? requirePeer(sessionId) : ''
-      return handler(args, peer, sessionId)
+      return handler(args, peer, sessionId, signal)
     }
 
   return [
@@ -770,20 +776,20 @@ export function hubTools(hub: AgentHub, registry: SessionRegistry, options: HubT
     },
     {
       name: 'bridge_wait',
-      description: 'Wait (long-poll) for the next message addressed to you. Resolves immediately when one is queued; otherwise blocks until one arrives or the timeout fires. `from` narrows to one sender. `ref` waits specifically for the ack of that task id. `threadId` narrows to one conversation thread. Loop this tool to hold a real-time conversation. With `ack: "manual"` the message is LEASED rather than consumed: it comes back (with `attempts` incremented) if you do not call bridge_commit in time, and is dead-lettered after too many hand-outs. Use it when losing a message would be worse than handling one twice.',
+      description: 'Wait (long-poll) for the next message addressed to you. Resolves immediately when one is queued; otherwise waits for the requested window (default 40s; server ceiling defaults to 45s, intended to stay below common 60s MCP tool-call limits). A timeout is a normal retryable result with explicit next-step guidance, not task completion: call bridge_wait again while the conversation is still active. `from` narrows to one sender. `ref` waits specifically for the ack of that task id. `threadId` narrows to one conversation thread. With `ack: "manual"` the message is LEASED rather than consumed: it comes back (with `attempts` incremented) if you do not call bridge_commit in time, and is dead-lettered after too many hand-outs. Use it when losing a message would be worse than handling one twice.',
       inputSchema: schema({
         from: optStr('Only wait for messages from this peerId.'),
         ref: optStr('Only wait for the ack of this task message id (bridge_task id).'),
         threadId: optStr('Only wait for messages carrying this threadId.'),
-        timeoutMs: int(`Max wait in milliseconds (default ${DEFAULT_WAIT_MS}, ceiling is server waitTimeoutMs).`),
+        timeoutMs: int(`Max wait in milliseconds (default ${DEFAULT_WAIT_MS}; capped by server waitTimeoutMs, 45s by default). A timeout result includes retry guidance; call bridge_wait again if you are still waiting for the conversation.`),
         maxMessages: int('Take up to this many already-queued messages in one call (default 1). With > 1 the result is {type:"messages", messages:[…]} instead of {type:"message", message:{…}} — the shape follows the request, not how many happened to be queued.'),
         ack: { type: 'string', enum: ['auto', 'manual'], description: '"auto" (default) consumes the message; "manual" leases it until bridge_commit (or bridge_nack).' },
       }),
-      handler: wrap(true, async (args, peer) => presentWait(await hub.wait(
+      handler: wrap(true, async (args, peer, _sessionId, signal) => presentWait(await hub.wait(
         peer,
         args.timeoutMs === undefined ? options.defaultWaitMs ?? DEFAULT_WAIT_MS : Number(args.timeoutMs),
         args.from === undefined ? undefined : String(args.from),
-        undefined,
+        signal,
         args.ref === undefined ? undefined : String(args.ref),
         args.threadId === undefined ? undefined : String(args.threadId),
         args.ack === 'manual',

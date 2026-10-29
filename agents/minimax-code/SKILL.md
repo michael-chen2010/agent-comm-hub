@@ -33,7 +33,9 @@ response is lost while the same Hub process is running, retry with the same UUID
   (`accepted`/`rejected`/`done`/`failed`), auto-routed back to the original
   sender.
 - `bridge_wait(from?, timeoutMs?)` — long-poll for the next message (default
-  30 s; loop it to hold a real-time conversation).
+  40 s; the default server ceiling is 45 s, below common 60 s MCP tool-call limits).
+  A timeout is a normal retryable result: follow `nextAction` and call again while
+  the conversation is active.
 - `bridge_poll(from?)` — non-blocking drain of every queued message.
 - `bridge_status()` / `bridge_peers()` — hub health and who is online.
 - `bridge_history(peer?, limit?)` — recent messages (newest first).
@@ -47,7 +49,7 @@ response is lost while the same Hub process is running, retry with the same UUID
    do NOT guess a peerId or send blindly; tell the user the other agent needs
    to be running and explicitly registered.
 3. Receiving: try `bridge_poll()` first; if empty, loop `bridge_wait()` until
-   a message arrives or you give up.
+   a message arrives or the user explicitly ends the wait.
 4. On receiving a `task` (content is `{prompt, context?, deliverable?}`):
    acknowledge with `bridge_ack(ref, "accepted")` when you take it on, then
    `bridge_ack(ref, "done"[, note])` when finished; use `"rejected"` to
@@ -58,7 +60,7 @@ response is lost while the same Hub process is running, retry with the same UUID
 
 - Messages travel on loopback only (127.0.0.1:18764); never put credentials
   in bridge messages.
-- A timeout is not a failure: `bridge_wait` returning `{type:"timeout"}` just
-  means nothing arrived — try again.
-- Cadence: use 10–30 s short polls when the peer is active; check
-  `bridge_peers()` when unsure.
+- A timeout is not a failure: the result includes `retryable: true`,
+  `taskCompleted: false`, and `nextAction`. If you are still waiting, call
+  `bridge_wait` again with the same filters. Keep each call below the configured
+  MCP client's tool-call timeout; check `bridge_peers()` when unsure.
